@@ -18,6 +18,7 @@
   #include "html_pixelforge.h"
 #endif
 #include "html_cpal.h"
+#include "html_wecker.h"
 #include "html_edit.h"
 
 // forward declarations
@@ -653,6 +654,34 @@ void initServer()
   server.on(_cpal_htm, HTTP_GET, [](AsyncWebServerRequest *request) {
     handleStaticContent(request, FPSTR(_cpal_htm), 200, FPSTR(CONTENT_TYPE_HTML), PAGE_cpal, PAGE_cpal_length);
   });
+
+  static const char _wecker_htm[] PROGMEM = "/wecker.htm";
+  server.on(_wecker_htm, HTTP_GET, [](AsyncWebServerRequest *request) {
+    handleStaticContent(request, FPSTR(_wecker_htm), 200, FPSTR(CONTENT_TYPE_HTML), PAGE_wecker, PAGE_wecker_length);
+  });
+
+  // Wecker alarm data stored on device so all browsers share the same list
+  static const char _wecker_json[] PROGMEM = "/wecker.json";
+  server.on(_wecker_json, HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (WLED_FS.exists(F("/wecker.json"))) {
+      request->send(WLED_FS, F("/wecker.json"), FPSTR(CONTENT_TYPE_JSON));
+    } else {
+      request->send(200, FPSTR(CONTENT_TYPE_JSON), F("[]"));
+    }
+  });
+  server.on(_wecker_json, HTTP_POST, [](AsyncWebServerRequest *request){}, nullptr,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      static String buf;
+      if (index == 0) buf = "";
+      buf += String((char*)data).substring(0, len);
+      if (index + len == total) {
+        File f = WLED_FS.open(F("/wecker.json"), "w");
+        if (f) { f.print(buf); f.close(); }
+        request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
+        buf = "";
+      }
+    }
+  );
 
 #ifdef WLED_ENABLE_WEBSOCKETS
   server.addHandler(&ws);
