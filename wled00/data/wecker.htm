@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1">
+  <meta name="theme-color" content="#222222">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Wecker – WLED</title>
+  <link rel="stylesheet" href="index.css">
+  <style>
+    body { background: var(--c-1); color: var(--c-d); font-family: Helvetica, Verdana, sans-serif; margin: 0; padding: 0; }
+
+    #header {
+      position: fixed; top: 0; left: 0; right: 0; height: 52px;
+      background: #1a1a1a; border-bottom: 1px solid #333;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; z-index: 10;
+    }
+    #header h1 { font-size: 18px; font-weight: 600; margin: 0; color: #fff; }
+    #btnBack { background: none; border: none; color: #48a; font-size: 17px; padding: 8px 0; cursor: pointer; min-width: 70px; text-align: left; }
+    #btnAdd  { background: none; border: none; color: #48a; font-size: 26px; line-height: 1; padding: 4px 0; cursor: pointer; min-width: 70px; text-align: right; }
+
+    #alarmList { margin-top: 64px; padding: 8px 12px 100px; }
+
+    .alarm-item {
+      background: #1e1e1e; border-radius: 14px; padding: 16px;
+      margin-bottom: 8px; display: flex; align-items: center; gap: 14px;
+      border: 1px solid #2a2a2a;
+    }
+    .alarm-left { flex: 1; cursor: pointer; user-select: none; }
+    .alarm-time { font-size: 44px; font-weight: 200; letter-spacing: -1px; color: #fff; line-height: 1; }
+    .alarm-time.off { color: #444; }
+    .alarm-label { font-size: 15px; color: #888; margin-top: 4px; }
+    .alarm-meta  { font-size: 13px; color: #555; margin-top: 3px; }
+    .alarm-days  { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+    .alarm-day-pip { font-size: 11px; padding: 2px 7px; border-radius: 10px; background: #2c2c2c; color: #666; }
+    .alarm-day-pip.on { background: #1a3a5c; color: #7ab; }
+    .alarm-toggle { flex-shrink: 0; }
+
+    .toggle { position: relative; display: inline-block; width: 51px; height: 31px; }
+    .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-track { position: absolute; inset: 0; background: #3a3a3a; border-radius: 31px; transition: background .2s; }
+    .toggle input:checked + .toggle-track { background: #2c1; }
+    .toggle-thumb { position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; background: #fff; border-radius: 50%; transition: transform .2s; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+    .toggle input:checked ~ .toggle-thumb { transform: translateX(20px); }
+
+    #emptyHint { text-align: center; padding: 80px 24px; color: #444; font-size: 16px; line-height: 1.6; display: none; }
+    #emptyHint .big { font-size: 48px; display: block; margin-bottom: 12px; }
+
+    #editPage { display: none; position: fixed; inset: 0; background: #111; z-index: 20; overflow-y: auto; }
+    #editPage.open { display: block; }
+
+    #editHeader {
+      position: sticky; top: 0; background: #1a1a1a; border-bottom: 1px solid #333;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; height: 52px; z-index: 1;
+    }
+    #editHeader span { font-size: 17px; font-weight: 600; color: #fff; }
+    .edit-cancel { background: none; border: none; color: #c44; font-size: 16px; padding: 8px 0; cursor: pointer; min-width: 80px; font-family: inherit; }
+    .edit-save   { background: none; border: none; color: #48a; font-size: 16px; font-weight: 600; padding: 8px 0; cursor: pointer; min-width: 80px; text-align: right; font-family: inherit; }
+    #editBody { padding: 16px; }
+
+    .time-display { text-align: center; margin-bottom: 8px; }
+    .time-display input[type=time] {
+      background: none; border: none; color: #fff;
+      font-size: 72px; font-weight: 200; letter-spacing: -2px;
+      width: 100%; text-align: center; padding: 8px 0; font-family: inherit;
+      -webkit-appearance: none; appearance: none;
+    }
+    .time-display input[type=time]:focus { outline: none; }
+    .waketime-hint { text-align: center; font-size: 14px; color: #555; margin-bottom: 20px; min-height: 20px; }
+
+    .card { background: #1e1e1e; border-radius: 14px; margin-bottom: 10px; overflow: hidden; border: 1px solid #2a2a2a; }
+    .card-row { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid #2a2a2a; }
+    .card-row:last-child { border-bottom: none; }
+    .card-row-label { flex: 1; font-size: 16px; color: #ddd; }
+    .card-row-label small { display: block; font-size: 12px; color: #555; margin-top: 2px; }
+    .card-row select {
+      background: #2a2a2a; border: none; color: #aaa; border-radius: 8px;
+      padding: 6px 10px; font-size: 15px; font-family: inherit; max-width: 180px;
+    }
+    .card-row input[type=text] {
+      background: #2a2a2a; border: none; color: #ddd; border-radius: 8px;
+      padding: 6px 10px; font-size: 15px; font-family: inherit;
+      width: 100%; box-sizing: border-box; text-align: right;
+    }
+    .card-row input[type=text]:focus { outline: 1px solid #48a; }
+
+    .day-picker-card { background: #1e1e1e; border-radius: 14px; padding: 14px 12px; margin-bottom: 10px; border: 1px solid #2a2a2a; }
+    .day-picker-label { font-size: 13px; color: #555; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 10px; }
+    .day-picker-row { display: flex; gap: 6px; }
+    .day-btn {
+      flex: 1; background: #2a2a2a; border: none; color: #666;
+      border-radius: 50%; aspect-ratio: 1; font-size: 12px; font-weight: 600;
+      cursor: pointer; padding: 0; transition: background .15s, color .15s;
+      min-width: 0; height: 40px;
+    }
+    .day-btn.active { background: #48a; color: #fff; }
+
+    #btnDelete { display: none; width: 100%; margin-top: 6px; background: #2a1515; border: 1px solid #5a2020; color: #c66; border-radius: 14px; padding: 14px; font-size: 16px; cursor: pointer; font-family: inherit; }
+    #btnDelete:active { background: #3a1a1a; }
+
+    #savingMsg { display: none; position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 10px 20px; border-radius: 20px; font-size: 14px; z-index: 30; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<div id="header">
+  <button id="btnBack" onclick="goBack()">&#x276E; Zurück</button>
+  <h1>Wecker</h1>
+  <button id="btnAdd" onclick="openEdit(null)">+</button>
+</div>
+
+<div id="alarmList"></div>
+<div id="emptyHint">
+  <span class="big">&#x23F0;</span>
+  Kein Wecker gestellt.<br>Tippe <b>+</b> um einen Wecker hinzuzufügen.
+</div>
+
+<div id="editPage">
+  <div id="editHeader">
+    <button class="edit-cancel" onclick="closeEdit()">Abbrechen</button>
+    <span id="editTitle">Neuer Wecker</span>
+    <button class="edit-save" onclick="saveAlarm()">Sichern</button>
+  </div>
+  <div id="editBody">
+    <div class="time-display">
+      <input type="time" id="fTime" value="07:00" oninput="updateWakeHint()">
+    </div>
+    <div class="waketime-hint" id="wakeHint"></div>
+
+    <div class="card">
+      <div class="card-row">
+        <span class="card-row-label">Vorlauf<small>Lampe geht X Minuten vor dem Wecker an</small></span>
+        <select id="fOffset" onchange="updateWakeHint()">
+          <option value="0">Kein</option>
+          <option value="10">10 min</option>
+          <option value="15">15 min</option>
+          <option value="20">20 min</option>
+          <option value="30" selected>30 min</option>
+          <option value="45">45 min</option>
+          <option value="60">60 min</option>
+          <option value="90">90 min</option>
+        </select>
+      </div>
+      <div class="card-row">
+        <span class="card-row-label">Preset<small>Welche Lichtszene wird aktiviert</small></span>
+        <select id="fPreset"></select>
+      </div>
+      <div class="card-row">
+        <span class="card-row-label">Bezeichnung</span>
+        <input type="text" id="fLabel" placeholder="Optional" maxlength="32">
+      </div>
+    </div>
+
+    <div class="day-picker-card">
+      <div class="day-picker-label">Wiederholen</div>
+      <div class="day-picker-row">
+        <!-- data-wled: bit position in WLED json dow (bit0=Mo..bit5=Sa,bit6=So) -->
+        <button class="day-btn" data-wled="0" data-js="1">Mo</button>
+        <button class="day-btn" data-wled="1" data-js="2">Di</button>
+        <button class="day-btn" data-wled="2" data-js="3">Mi</button>
+        <button class="day-btn" data-wled="3" data-js="4">Do</button>
+        <button class="day-btn" data-wled="4" data-js="5">Fr</button>
+        <button class="day-btn" data-wled="5" data-js="6">Sa</button>
+        <button class="day-btn" data-wled="6" data-js="0">So</button>
+      </div>
+    </div>
+
+    <button id="btnDelete" onclick="deleteAlarm()">Wecker löschen</button>
+  </div>
+</div>
+
+<div id="savingMsg">Wird gespeichert…</div>
+
+<script>
+const OFF_PRESET   = 250;
+const AUTO_OFF_MIN = 60;
+
+const DOW_ALL  = 127;
+const DOW_WDAY = 31;
+const DOW_WEND = 96;
+const DAY_NAMES = ['Mo','Di','Mi','Do','Fr','Sa','So'];
+
+// Alarm data lives on the WLED device at /wecker.json so all browsers share it
+let _alarms = null; // in-memory cache, loaded once on init
+
+async function loadAlarmsRemote() {
+  try {
+    const r = await fetch('/wecker.json');
+    _alarms = r.ok ? await r.json() : [];
+  } catch(e) { _alarms = []; }
+}
+
+function loadAlarms() { return _alarms || []; }
+
+async function saveAlarms(list) {
+  _alarms = list;
+  await fetch('/wecker.json', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(list)
+  });
+}
+function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function addMinutes(h, m, add) {
+  let t = ((h * 60 + m + add) % 1440 + 1440) % 1440;
+  return { h: Math.floor(t / 60), m: t % 60, wraps: (h * 60 + m + add) >= 1440 };
+}
+function subtractMinutes(h, m, sub) {
+  let t = ((h * 60 + m - sub) % 1440 + 1440) % 1440;
+  return { h: Math.floor(t / 60), m: t % 60 };
+}
+
+// Rotate WLED dow bitmask by +1 day (for off-timer that wraps past midnight)
+function rotateDow(dow) {
+  if (dow === 0) return 0;
+  let r = 0;
+  for (let i = 0; i < 7; i++) if (dow & (1 << i)) r |= (1 << ((i + 1) % 7));
+  return r;
+}
+
+function dowLabel(dow) {
+  if (dow === 0)        return 'Einmalig';
+  if (dow === DOW_ALL)  return 'Täglich';
+  if (dow === DOW_WDAY) return 'Mo – Fr';
+  if (dow === DOW_WEND) return 'Sa + So';
+  return DAY_NAMES.filter((_, i) => dow & (1 << i)).join(' ');
+}
+
+function goBack() { window.location.href = '/'; }
+
+function populatePresets(selectedId) {
+  const sel = document.getElementById('fPreset');
+  sel.innerHTML = '';
+  let presets = [];
+  try { presets = JSON.parse(localStorage.getItem('wledP') || '[]'); } catch(e) {}
+  const source = presets.length
+    ? presets.filter(p => p && p.id && p.id !== OFF_PRESET)
+              .map(p => ({ id: p.id, name: p.n ? `${p.id} – ${p.n}` : `Preset ${p.id}` }))
+    : Array.from({length: 16}, (_, i) => ({ id: i + 1, name: `Preset ${i + 1}` }));
+  source.forEach(({ id, name }) => {
+    const o = document.createElement('option');
+    o.value = id; o.textContent = name;
+    if (id === selectedId) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderAlarms() {
+  const list = document.getElementById('alarmList');
+  const hint = document.getElementById('emptyHint');
+  const alarms = loadAlarms();
+  list.innerHTML = '';
+  if (!alarms.length) { hint.style.display = 'block'; return; }
+  hint.style.display = 'none';
+
+  alarms.slice().sort((a, b) => (a.wakeH * 60 + a.wakeM) - (b.wakeH * 60 + b.wakeM))
+    .forEach(alarm => {
+      const fire = subtractMinutes(alarm.wakeH, alarm.wakeM, alarm.offsetMin);
+      const metaParts = [];
+      if (alarm.offsetMin > 0) metaParts.push(`Lampe um ${pad2(fire.h)}:${pad2(fire.m)}`);
+      metaParts.push(`Preset ${alarm.preset} · Aus nach 1h`);
+
+      const dayPills = DAY_NAMES.map((name, i) => {
+        const on = alarm.dow !== 0 && !!(alarm.dow & (1 << i));
+        return `<span class="alarm-day-pip${on ? ' on' : ''}">${name}</span>`;
+      }).join('');
+
+      const item = document.createElement('div');
+      item.className = 'alarm-item';
+      item.innerHTML = `
+        <div class="alarm-left" onclick="openEdit('${alarm.id}')">
+          <div class="alarm-time${alarm.enabled ? '' : ' off'}">${pad2(alarm.wakeH)}:${pad2(alarm.wakeM)}</div>
+          ${alarm.label ? `<div class="alarm-label">${alarm.label}</div>` : ''}
+          <div class="alarm-meta">${metaParts.join(' · ')}</div>
+          <div class="alarm-days">${dayPills}</div>
+        </div>
+        <div class="alarm-toggle">
+          <label class="toggle" onclick="event.stopPropagation()">
+            <input type="checkbox" ${alarm.enabled ? 'checked' : ''} onchange="toggleAlarm('${alarm.id}',this.checked)">
+            <span class="toggle-track"></span>
+            <span class="toggle-thumb"></span>
+          </label>
+        </div>`;
+      list.appendChild(item);
+    });
+}
+
+function toggleAlarm(id, enabled) {
+  const alarms = loadAlarms();
+  const a = alarms.find(x => x.id === id);
+  if (!a) return;
+  a.enabled = enabled;
+  saveAlarms(alarms).then(() => syncToWled(alarms));
+  renderAlarms();
+}
+
+// ── Edit ──────────────────────────────────────────────────────────────────────
+let editingId = null;
+
+function openEdit(id) {
+  editingId = id;
+  const alarm = id ? loadAlarms().find(a => a.id === id) : null;
+  document.getElementById('editTitle').textContent = alarm ? 'Wecker bearbeiten' : 'Neuer Wecker';
+  document.getElementById('fTime').value = alarm ? `${pad2(alarm.wakeH)}:${pad2(alarm.wakeM)}` : '07:00';
+  document.getElementById('fOffset').value = alarm ? String(alarm.offsetMin) : '30';
+  document.getElementById('fLabel').value = alarm ? (alarm.label || '') : '';
+  document.getElementById('btnDelete').style.display = alarm ? 'block' : 'none';
+  populatePresets(alarm ? alarm.preset : 1);
+  const activeDow = alarm ? alarm.dow : DOW_WDAY;
+  document.querySelectorAll('.day-btn').forEach(btn => {
+    const bit = parseInt(btn.dataset.wled);
+    btn.classList.toggle('active', !!(activeDow & (1 << bit)));
+    btn.onclick = () => btn.classList.toggle('active');
+  });
+  updateWakeHint();
+  document.getElementById('editPage').classList.add('open');
+  window.scrollTo(0, 0);
+}
+
+function closeEdit() { document.getElementById('editPage').classList.remove('open'); }
+
+function updateWakeHint() {
+  const val = document.getElementById('fTime').value;
+  const offset = parseInt(document.getElementById('fOffset').value) || 0;
+  const el = document.getElementById('wakeHint');
+  if (!val) { el.textContent = ''; return; }
+  const [h, m] = val.split(':').map(Number);
+  const fire = subtractMinutes(h, m, offset);
+  const off  = addMinutes(fire.h, fire.m, AUTO_OFF_MIN);
+  if (offset === 0) {
+    el.textContent = `Licht aus um ${pad2(off.h)}:${pad2(off.m)}`;
+  } else {
+    el.textContent = `Lampe an um ${pad2(fire.h)}:${pad2(fire.m)} · Aus um ${pad2(off.h)}:${pad2(off.m)}`;
+  }
+}
+
+async function saveAlarm() {
+  const val = document.getElementById('fTime').value;
+  if (!val) { alert('Bitte eine Zeit eingeben.'); return; }
+  const [wakeH, wakeM] = val.split(':').map(Number);
+  const offsetMin = parseInt(document.getElementById('fOffset').value) || 0;
+  const label = document.getElementById('fLabel').value.trim();
+  const preset = parseInt(document.getElementById('fPreset').value) || 1;
+  let dow = 0;
+  document.querySelectorAll('.day-btn.active').forEach(btn => { dow |= (1 << parseInt(btn.dataset.wled)); });
+  const alarms = loadAlarms();
+  if (editingId) {
+    const idx = alarms.findIndex(a => a.id === editingId);
+    if (idx >= 0) alarms[idx] = { ...alarms[idx], wakeH, wakeM, offsetMin, label, preset, dow };
+  } else {
+    alarms.push({ id: uid(), enabled: true, wakeH, wakeM, offsetMin, label, preset, dow });
+  }
+  await saveAlarms(alarms); closeEdit(); renderAlarms(); syncToWled(alarms);
+}
+
+async function deleteAlarm() {
+  if (!editingId || !confirm('Wecker löschen?')) return;
+  const alarms = loadAlarms().filter(a => a.id !== editingId);
+  await saveAlarms(alarms); closeEdit(); renderAlarms(); syncToWled(alarms);
+}
+
+// ── Off-preset management ─────────────────────────────────────────────────────
+// Checks device whether preset OFF_PRESET exists; writes it if missing.
+// Done on every sync so it survives firmware flashes and factory resets.
+async function ensureOffPreset() {
+  try {
+    const presets = await fetch('/presets.json').then(r => r.json());
+    if (presets[String(OFF_PRESET)]) return; // already exists on device
+    const state = await fetch('/json/state').then(r => r.json());
+    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: false, transition: 0, psave: OFF_PRESET, n: 'Wecker Aus' }) });
+    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: state.on, bri: state.bri, transition: state.transition || 7 }) });
+  } catch(e) { /* non-fatal */ }
+}
+
+// ── Sync to WLED ──────────────────────────────────────────────────────────────
+// Each enabled alarm produces TWO timer entries:
+//   1. ON  at (wakeTime - offsetMin) → alarm preset
+//   2. OFF at (wakeTime + AUTO_OFF_MIN) → OFF_PRESET (lights out)
+// The off-timer dow is rotated by 1 day if it wraps past midnight.
+async function syncToWled(alarms) {
+  await ensureOffPreset();
+  const msg = document.getElementById('savingMsg');
+  msg.style.display = 'block';
+
+  const ins = [];
+  alarms.filter(a => a.enabled).forEach(a => {
+    const fire = subtractMinutes(a.wakeH, a.wakeM, a.offsetMin);
+    const off  = addMinutes(fire.h, fire.m, AUTO_OFF_MIN);
+    const offDow = off.wraps ? rotateDow(a.dow) : a.dow;
+
+    ins.push({ en: 1, hour: fire.h, min: fire.m, macro: a.preset,
+               dow: a.dow, start: { mon: 1, day: 1 }, end: { mon: 12, day: 31 } });
+    ins.push({ en: 1, hour: off.h,  min: off.m,  macro: OFF_PRESET,
+               dow: offDow, start: { mon: 1, day: 1 }, end: { mon: 12, day: 31 } });
+  });
+
+  try {
+    const r = await fetch('/json/cfg', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timers: { ins, cntdwn: { goal: [2099,1,1,0,0,0], macro: 0 } } })
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch(e) {
+    alert('Fehler beim Speichern: ' + e.message);
+  } finally {
+    msg.style.display = 'none';
+  }
+}
+
+// ── Time sync + Init ──────────────────────────────────────────────────────────
+fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ time: Math.floor(Date.now() / 1000) }) });
+
+loadAlarmsRemote().then(renderAlarms);
+</script>
+</body>
+</html>
