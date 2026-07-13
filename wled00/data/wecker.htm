@@ -368,14 +368,10 @@ async function deleteAlarm() {
 // Checks device whether preset OFF_PRESET exists; writes it if missing.
 // Done on every sync so it survives firmware flashes and factory resets.
 async function ensureOffPreset() {
+  // Always write preset 250 as off-state so it survives corrupt/wrong saves
   try {
-    const presets = await fetch('/presets.json').then(r => r.json());
-    if (presets[String(OFF_PRESET)]) return; // already exists on device
-    const state = await fetch('/json/state').then(r => r.json());
     await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: false, transition: 0, psave: OFF_PRESET, n: 'Wecker Aus' }) });
-    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: state.on, bri: state.bri, transition: state.transition || 7 }) });
+      body: JSON.stringify({ on: false, bri: 0, transition: 0, psave: OFF_PRESET, n: 'Wecker Aus' }) });
   } catch(e) { /* non-fatal */ }
 }
 
