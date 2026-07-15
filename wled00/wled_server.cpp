@@ -1,5 +1,63 @@
 #include "wled.h"
 
+// Helper: rebuild WLED timers from wecker.json
+static void weckerRebuildTimers() {
+  if (!WLED_FS.exists(F("/wecker.json"))) return;
+  File f = WLED_FS.open(F("/wecker.json"), "r");
+  if (!f) return;
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  f.close();
+
+  clearTimers();
+  int idx = 0;
+  for (JsonObject alarm : doc.as<JsonArray>()) {
+    if (!alarm["enabled"].as<bool>()) continue;
+    int wakeH   = alarm["wakeH"]    | 0;
+    int wakeM   = alarm["wakeM"]    | 0;
+    int offset  = alarm["offsetMin"]| 0;
+    uint8_t dow = alarm["dow"]      | 127;
+    uint8_t presetId = 240 + idx;
+
+    int fireTotal = ((wakeH * 60 + wakeM - offset) % 1440 + 1440) % 1440;
+    uint8_t fireH = fireTotal / 60;
+    int8_t  fireM = fireTotal % 60;
+    uint8_t weekdays = (dow << 1) | 1;
+
+    addTimer(presetId, fireH, fireM, weekdays, 1, 12, 1, 31);
+    idx++;
+  }
+  configNeedsWrite = true;
+}
+
+// Handler for POST /wecker/on and /wecker/off
+static void handleWeckerToggle(AsyncWebServerRequest *request, bool enable) {
+  if (!WLED_FS.exists(F("/wecker.json"))) {
+    request->send(404, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"no alarms\"}"));
+    return;
+  }
+  File f = WLED_FS.open(F("/wecker.json"), "r");
+  if (!f) { request->send(500, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"read failed\"}")); return; }
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, f)) { f.close(); request->send(400, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"parse failed\"}")); return; }
+  f.close();
+
+  const char* id = request->hasParam("id") ? request->getParam("id")->value().c_str() : nullptr;
+
+  for (JsonObject alarm : doc.as<JsonArray>()) {
+    if (!id || strcmp(alarm["id"].as<const char*>(), id) == 0) {
+      alarm["enabled"] = enable;
+    }
+  }
+
+  // Write updated wecker.json
+  f = WLED_FS.open(F("/wecker.json"), "w");
+  if (f) { serializeJson(doc, f); f.close(); }
+
+  weckerRebuildTimers();
+  request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
+}
+
 #ifndef WLED_DISABLE_OTA
   #include "ota_update.h"  
 #endif
@@ -659,6 +717,9 @@ void initServer()
   server.on(_wecker_htm, HTTP_GET, [](AsyncWebServerRequest *request) {
     handleStaticContent(request, FPSTR(_wecker_htm), 200, FPSTR(CONTENT_TYPE_HTML), PAGE_wecker, PAGE_wecker_length);
   });
+
+  server.on(F("/wecker/on"),  HTTP_POST, [](AsyncWebServerRequest *request){ handleWeckerToggle(request, true);  });
+  server.on(F("/wecker/off"), HTTP_POST, [](AsyncWebServerRequest *request){ handleWeckerToggle(request, false); });
 
   // Wecker alarm data stored on device so all browsers share the same list
   static const char _wecker_json[] PROGMEM = "/wecker.json";
