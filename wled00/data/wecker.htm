@@ -174,8 +174,6 @@
 <div id="savingMsg">Wird gespeichert…</div>
 
 <script>
-const AUTO_OFF_MIN = 60;
-
 const DOW_ALL  = 127;
 const DOW_WDAY = 31;
 const DOW_WEND = 96;
@@ -352,31 +350,18 @@ async function deleteAlarm() {
 
 // ── Sync to WLED ──────────────────────────────────────────────────────────────
 // Each enabled alarm produces ONE timer. The timer fires a preset (240+i)
-// that contains the user's preset state + nightlight auto-off after AUTO_OFF_MIN.
-// Preset is written with "o":true (synchronous path) so WLED saves the request
-// JSON directly instead of the current live state.
+// One timer per alarm firing the user's preset directly.
+// ntp.cpp reads wecker.json on timer fire and starts nightlight automatically.
 async function syncToWled(alarms) {
   const msg = document.getElementById('savingMsg');
   msg.style.display = 'block';
 
   const ins = [];
-  const enabled = alarms.filter(a => a.enabled);
-
-  for (let i = 0; i < enabled.length; i++) {
-    const a = enabled[i];
-    const presetId = 240 + i;
+  alarms.filter(a => a.enabled).forEach(a => {
     const fire = subtractMinutes(a.wakeH, a.wakeM, a.offsetMin);
-
-    // Save wecker preset with nightlight using synchronous path (o:true).
-    // This preserves the user's chosen preset ID in "ps" so WLED loads it,
-    // then immediately activates nightlight on top.
-    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ps: a.preset, nl: { on: true, dur: AUTO_OFF_MIN, mode: 0, tbri: 0 },
-                             o: true, psave: presetId, n: `Wecker ${pad2(a.wakeH)}:${pad2(a.wakeM)}` }) });
-
-    ins.push({ en: 1, hour: fire.h, min: fire.m, macro: presetId,
+    ins.push({ en: 1, hour: fire.h, min: fire.m, macro: a.preset,
                dow: a.dow, start: { mon: 1, day: 1 }, end: { mon: 12, day: 31 } });
-  }
+  });
 
   try {
     const r = await fetch('/json/cfg', {
