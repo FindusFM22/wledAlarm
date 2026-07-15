@@ -75,11 +75,13 @@ private:
   }
 
   bool checkPresence() {
-    IPAddress ip = MDNS.queryHost(hostname, 2000); // 2s timeout
-    bool present = (ip != IPAddress());
-    DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → %s\n"),
-      hostname, present ? ip.toString().c_str() : "not found");
-    return present;
+    char fqdn[72];
+    snprintf(fqdn, sizeof(fqdn), "%s.local", hostname);
+    IPAddress ip;
+    bool found = WiFi.hostByName(fqdn, ip, 3000);
+    DEBUG_PRINTF_P(PSTR("[WeckerPresence] %s → %s\n"),
+      fqdn, found ? ip.toString().c_str() : "not found");
+    return found;
   }
 
 public:
@@ -147,8 +149,3 @@ public:
 
   uint16_t getId() override { return 0xAA01; }
 };
-
-const char WeckerPresenceUsermod::_name[] PROGMEM = "wecker_presence";
-
-// Self-register
-namespace { WeckerPresenceUsermod weckerPresence; REGISTER_USERMOD(weckerPresence); }
