@@ -25,6 +25,8 @@ private:
   bool     lastPresent    = true;
   bool     checkedToday   = false;
   bool     checkRequested = false;
+  bool     nlStarted      = false;
+  uint8_t  lastPreset     = 0;
 
   // Find the earliest fire time (in minutes since midnight) across all enabled timers
   int earliestTimerMinute() {
@@ -129,6 +131,9 @@ public:
     if (!enabled) return;
     if (!WLED_CONNECTED) return;
 
+    // Reset nlStarted when preset changes so next wecker preset triggers nightlight again
+    if (currentPreset != lastPreset) { nlStarted = false; lastPreset = currentPreset; }
+
     // On-demand check triggered by HTTP GET /wecker/presence
     if (checkRequested) {
       checkRequested = false;
@@ -168,6 +173,36 @@ public:
       rebuildTimers();
     }
     lastPresent = present;
+  }
+
+  // Called after a preset is applied — start nightlight if it's a wecker preset
+  void onStateChange(uint8_t mode) override {
+    if (!enabled) return;
+    if (currentPreset <= 0 || nlStarted) return;
+    if (!WLED_FS.exists(F("/wecker.json"))) return;
+
+    File wf = WLED_FS.open(F("/wecker.json"), "r");
+    if (!wf) return;
+    DynamicJsonDocument doc(2048);
+    bool isWecker = false;
+    if (!deserializeJson(doc, wf)) {
+      for (JsonObject alarm : doc.as<JsonArray>()) {
+        if (alarm["enabled"].as<bool>() && (alarm["preset"] | 0) == currentPreset) {
+          isWecker = true; break;
+        }
+      }
+    }
+    wf.close();
+
+    if (isWecker) {
+      nightlightActive    = true;
+      nightlightActiveOld = false;
+      nightlightDelayMins = 60;
+      nightlightMode      = NL_MODE_FADE;
+      nightlightTargetBri = 0;
+      nlStarted = true;
+      DEBUG_PRINTLN(F("[WeckerPresence] Wecker preset fired — starting 60min nightlight"));
+    }
   }
 
   void addToConfig(JsonObject& root) override {
