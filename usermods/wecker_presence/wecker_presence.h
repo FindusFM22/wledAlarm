@@ -22,11 +22,9 @@ private:
   char     hostname[64]  = "Findus-mobile";
   uint8_t  checkMins     = 10;   // check this many minutes before earliest alarm
 
-  bool     lastPresent   = true;
-  uint32_t lastCheckMs   = 0;
-  bool     checkedToday  = false;
-  uint8_t  lastCheckDay  = 255;
-  bool     checkRequested = false;  // set by HTTP to trigger check in loop()
+  bool     lastPresent    = true;
+  bool     checkedToday   = false;
+  bool     checkRequested = false;
 
   // Find the earliest fire time (in minutes since midnight) across all enabled timers
   int earliestTimerMinute() {
@@ -141,22 +139,22 @@ public:
 
     if (timers.empty()) return;
 
-    // Run once per day, checkMins before the earliest alarm
-    uint8_t today = weekday(localTime);
-    if (today != lastCheckDay) {
-      checkedToday = false;
-      lastCheckDay = today;
-    }
-    if (checkedToday) return;
-
+    // Find the next alarm that will fire today (or tomorrow if past midnight)
     int earliest = earliestTimerMinute();
     if (earliest < 0) return;
 
-    int nowMin  = hour(localTime) * 60 + minute(localTime);
-    int target  = earliest - checkMins;
+    int nowMin = hour(localTime) * 60 + minute(localTime);
+    int target = earliest - checkMins;
     if (target < 0) target = 0;
 
-    // Fire within a 1-minute window around target
+    // Only check once per alarm — reset when we pass the alarm time
+    if (nowMin > earliest + 2) {
+      checkedToday = false; // reset after alarm fired, ready for next day
+    }
+
+    if (checkedToday) return;
+
+    // Fire within a 1-minute window before the alarm
     if (nowMin < target || nowMin > target + 1) return;
 
     checkedToday = true;
