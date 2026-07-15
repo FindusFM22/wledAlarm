@@ -1,0 +1,6 @@
+{
+  "name": "wecker_presence",
+  "build": {
+    "libArchive": false
+  }
+}
