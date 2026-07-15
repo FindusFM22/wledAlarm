@@ -174,7 +174,6 @@
 <div id="savingMsg">Wird gespeichert…</div>
 
 <script>
-const OFF_PRESET   = 250;
 const AUTO_OFF_MIN = 60;
 
 const DOW_ALL  = 127;
@@ -205,21 +204,9 @@ async function saveAlarms(list) {
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 function pad2(n) { return String(n).padStart(2, '0'); }
 
-function addMinutes(h, m, add) {
-  let t = ((h * 60 + m + add) % 1440 + 1440) % 1440;
-  return { h: Math.floor(t / 60), m: t % 60, wraps: (h * 60 + m + add) >= 1440 };
-}
 function subtractMinutes(h, m, sub) {
   let t = ((h * 60 + m - sub) % 1440 + 1440) % 1440;
   return { h: Math.floor(t / 60), m: t % 60 };
-}
-
-// Rotate WLED dow bitmask by +1 day (for off-timer that wraps past midnight)
-function rotateDow(dow) {
-  if (dow === 0) return 0;
-  let r = 0;
-  for (let i = 0; i < 7; i++) if (dow & (1 << i)) r |= (1 << ((i + 1) % 7));
-  return r;
 }
 
 function dowLabel(dow) {
@@ -263,7 +250,7 @@ function renderAlarms() {
       const fire = subtractMinutes(alarm.wakeH, alarm.wakeM, alarm.offsetMin);
       const metaParts = [];
       if (alarm.offsetMin > 0) metaParts.push(`Lampe um ${pad2(fire.h)}:${pad2(fire.m)}`);
-      metaParts.push(`Preset ${alarm.preset} · Aus nach 1h`);
+      metaParts.push(`Preset ${alarm.preset} · aus nach ${AUTO_OFF_MIN} min`);
 
       const dayPills = DAY_NAMES.map((name, i) => {
         const on = alarm.dow !== 0 && !!(alarm.dow & (1 << i));
@@ -331,11 +318,10 @@ function updateWakeHint() {
   if (!val) { el.textContent = ''; return; }
   const [h, m] = val.split(':').map(Number);
   const fire = subtractMinutes(h, m, offset);
-  const off  = addMinutes(fire.h, fire.m, AUTO_OFF_MIN);
   if (offset === 0) {
-    el.textContent = `Licht aus um ${pad2(off.h)}:${pad2(off.m)}`;
+    el.textContent = `Licht aus nach ${AUTO_OFF_MIN} min`;
   } else {
-    el.textContent = `Lampe an um ${pad2(fire.h)}:${pad2(fire.m)} · Aus um ${pad2(off.h)}:${pad2(off.m)}`;
+    el.textContent = `Lampe an um ${pad2(fire.h)}:${pad2(fire.m)} · aus nach ${AUTO_OFF_MIN} min`;
   }
 }
 
@@ -364,38 +350,33 @@ async function deleteAlarm() {
   await saveAlarms(alarms); closeEdit(); renderAlarms(); syncToWled(alarms);
 }
 
-// ── Off-preset management ─────────────────────────────────────────────────────
-// Checks device whether preset OFF_PRESET exists; writes it if missing.
-// Done on every sync so it survives firmware flashes and factory resets.
-async function ensureOffPreset() {
-  // Always write preset 250 as off-state so it survives corrupt/wrong saves
-  try {
-    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: false, bri: 0, transition: 0, psave: OFF_PRESET, n: 'Wecker Aus' }) });
-  } catch(e) { /* non-fatal */ }
-}
-
 // ── Sync to WLED ──────────────────────────────────────────────────────────────
-// Each enabled alarm produces TWO timer entries:
-//   1. ON  at (wakeTime - offsetMin) → alarm preset
-//   2. OFF at (wakeTime + AUTO_OFF_MIN) → OFF_PRESET (lights out)
-// The off-timer dow is rotated by 1 day if it wraps past midnight.
+// Each enabled alarm produces ONE timer. The timer fires a preset (240+i)
+// that contains the user's preset state + nightlight auto-off after AUTO_OFF_MIN.
+// Preset is written with "o":true (synchronous path) so WLED saves the request
+// JSON directly instead of the current live state.
 async function syncToWled(alarms) {
-  await ensureOffPreset();
   const msg = document.getElementById('savingMsg');
   msg.style.display = 'block';
 
   const ins = [];
-  alarms.filter(a => a.enabled).forEach(a => {
-    const fire = subtractMinutes(a.wakeH, a.wakeM, a.offsetMin);
-    const off  = addMinutes(fire.h, fire.m, AUTO_OFF_MIN);
-    const offDow = off.wraps ? rotateDow(a.dow) : a.dow;
+  const enabled = alarms.filter(a => a.enabled);
 
-    ins.push({ en: 1, hour: fire.h, min: fire.m, macro: a.preset,
+  for (let i = 0; i < enabled.length; i++) {
+    const a = enabled[i];
+    const presetId = 240 + i;
+    const fire = subtractMinutes(a.wakeH, a.wakeM, a.offsetMin);
+
+    // Save wecker preset with nightlight using synchronous path (o:true).
+    // This preserves the user's chosen preset ID in "ps" so WLED loads it,
+    // then immediately activates nightlight on top.
+    await fetch('/json', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ps: a.preset, nl: { on: true, dur: AUTO_OFF_MIN, mode: 0, tbri: 0 },
+                             o: true, psave: presetId, n: `Wecker ${pad2(a.wakeH)}:${pad2(a.wakeM)}` }) });
+
+    ins.push({ en: 1, hour: fire.h, min: fire.m, macro: presetId,
                dow: a.dow, start: { mon: 1, day: 1 }, end: { mon: 12, day: 31 } });
-    ins.push({ en: 1, hour: off.h,  min: off.m,  macro: OFF_PRESET,
-               dow: offDow, start: { mon: 1, day: 1 }, end: { mon: 12, day: 31 } });
-  });
+  }
 
   try {
     const r = await fetch('/json/cfg', {
