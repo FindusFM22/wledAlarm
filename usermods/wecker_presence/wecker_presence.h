@@ -26,6 +26,7 @@ private:
   uint32_t lastCheckMs   = 0;
   bool     checkedToday  = false;
   uint8_t  lastCheckDay  = 255;
+  bool     checkRequested = false;  // set by HTTP to trigger check in loop()
 
   // Find the earliest fire time (in minutes since midnight) across all enabled timers
   int earliestTimerMinute() {
@@ -75,21 +76,69 @@ private:
   }
 
   bool checkPresence() {
+    // Step 1: resolve hostname via mDNS
     char fqdn[72];
     snprintf(fqdn, sizeof(fqdn), "%s.local", hostname);
     IPAddress ip;
-    bool found = WiFi.hostByName(fqdn, ip, 3000);
-    DEBUG_PRINTF_P(PSTR("[WeckerPresence] %s → %s\n"),
-      fqdn, found ? ip.toString().c_str() : "not found");
-    return found;
+    if (!WiFi.hostByName(fqdn, ip, 3000)) {
+      DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → not found\n"), fqdn);
+      return false;
+    }
+    DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → %s\n"), fqdn, ip.toString().c_str());
+
+    // Step 2: TCP connect to port 62078 (Apple Lockdown) — responds even with screen off
+    // If iPhone is truly present, it replies with RST (ECONNREFUSED = present!)
+    // If not reachable, connect times out (not present)
+    WiFiClient client;
+    client.setTimeout(2000);
+    bool connected = client.connect(ip, 62078);
+    if (connected) {
+      client.stop();
+      DEBUG_PRINTLN(F("[WeckerPresence] TCP 62078 → connected (present)"));
+      return true;
+    }
+    // ECONNREFUSED also means device is there (RST = device exists but port closed)
+    // Arduino WiFiClient returns false on RST but very quickly (<50ms)
+    // A true timeout takes the full 2000ms
+    // We check by timing the connect attempt
+    // (Already handled: connect() returned false after RST = still present)
+    // Unfortunately Arduino API doesn't distinguish RST from timeout easily.
+    // Use a second attempt with very short timeout to detect RST vs timeout:
+    uint32_t t = millis();
+    WiFiClient client2;
+    client2.setTimeout(100); // 100ms — RST comes back instantly, timeout won't
+    bool c2 = client2.connect(ip, 62078);
+    uint32_t elapsed = millis() - t;
+    client2.stop();
+    DEBUG_PRINTF_P(PSTR("[WeckerPresence] TCP 62078 quick check: %dms\n"), elapsed);
+    // If it responded within 100ms (even with RST), device is present
+    return elapsed < 90;
   }
 
 public:
-  void setup() override {}
+  void setup() override {
+    server.on(F("/wecker/presence"), HTTP_GET, [this](AsyncWebServerRequest *request){
+      // Returns cached result immediately; trigger fresh check for next call
+      checkRequested = true;
+      String resp = lastPresent
+        ? F("{\"present\":true,\"status\":\"zuhause\"}")
+        : F("{\"present\":false,\"status\":\"nicht zuhause\"}");
+      request->send(200, FPSTR(CONTENT_TYPE_JSON), resp);
+    });
+  }
 
   void loop() override {
     if (!enabled) return;
     if (!WLED_CONNECTED) return;
+
+    // On-demand check triggered by HTTP GET /wecker/presence
+    if (checkRequested) {
+      checkRequested = false;
+      lastPresent = checkPresence();
+      if (!lastPresent) disableTimers(); else rebuildTimers();
+      return;
+    }
+
     if (timers.empty()) return;
 
     // Run once per day, checkMins before the earliest alarm
@@ -148,4 +197,13 @@ public:
   }
 
   uint16_t getId() override { return 0xAA01; }
+
+  // Public for on-demand test via HTTP
+  bool testNow() {
+    bool present = checkPresence();
+    lastPresent = present;
+    if (!present) disableTimers();
+    else rebuildTimers();
+    return present;
+  }
 };
