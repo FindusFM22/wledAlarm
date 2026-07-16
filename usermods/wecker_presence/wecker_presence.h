@@ -86,33 +86,19 @@ private:
     }
     DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → %s\n"), fqdn, ip.toString().c_str());
 
-    // Step 2: TCP connect to port 62078 (Apple Lockdown) — responds even with screen off
-    // If iPhone is truly present, it replies with RST (ECONNREFUSED = present!)
-    // If not reachable, connect times out (not present)
-    WiFiClient client;
-    client.setTimeout(2000);
-    bool connected = client.connect(ip, 62078);
-    if (connected) {
+    // Step 2: try TCP port 62078 three times — iPhone may be in deep sleep
+    for (int attempt = 0; attempt < 3; attempt++) {
+      uint32_t t = millis();
+      WiFiClient client;
+      client.setTimeout(150);
+      client.connect(ip, 62078);
+      uint32_t elapsed = millis() - t;
       client.stop();
-      DEBUG_PRINTLN(F("[WeckerPresence] TCP 62078 → connected (present)"));
-      return true;
+      DEBUG_PRINTF_P(PSTR("[WeckerPresence] TCP attempt %d: %dms\n"), attempt, elapsed);
+      if (elapsed < 130) return true; // RST came back fast = device present
+      delay(500); // wait before retry
     }
-    // ECONNREFUSED also means device is there (RST = device exists but port closed)
-    // Arduino WiFiClient returns false on RST but very quickly (<50ms)
-    // A true timeout takes the full 2000ms
-    // We check by timing the connect attempt
-    // (Already handled: connect() returned false after RST = still present)
-    // Unfortunately Arduino API doesn't distinguish RST from timeout easily.
-    // Use a second attempt with very short timeout to detect RST vs timeout:
-    uint32_t t = millis();
-    WiFiClient client2;
-    client2.setTimeout(100); // 100ms — RST comes back instantly, timeout won't
-    bool c2 = client2.connect(ip, 62078);
-    uint32_t elapsed = millis() - t;
-    client2.stop();
-    DEBUG_PRINTF_P(PSTR("[WeckerPresence] TCP 62078 quick check: %dms\n"), elapsed);
-    // If it responded within 100ms (even with RST), device is present
-    return elapsed < 90;
+    return false;
   }
 
 public:
@@ -165,9 +151,17 @@ public:
     checkedToday = true;
     bool present = checkPresence();
 
-    if (!present && lastPresent) {
-      DEBUG_PRINTLN(F("[WeckerPresence] Not home — disabling timers"));
-      disableTimers();
+    if (!present) {
+      // Only disable if previously present — fail-safe: keep timers on doubt
+      if (lastPresent) {
+        // Double-check with a second pass before disabling
+        delay(2000);
+        present = checkPresence();
+      }
+      if (!present && lastPresent) {
+        DEBUG_PRINTLN(F("[WeckerPresence] Not home — disabling timers"));
+        disableTimers();
+      }
     } else if (present && !lastPresent) {
       DEBUG_PRINTLN(F("[WeckerPresence] Home again — rebuilding timers"));
       rebuildTimers();
