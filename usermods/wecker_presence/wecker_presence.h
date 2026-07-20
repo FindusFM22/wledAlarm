@@ -1,4 +1,5 @@
 #pragma once
+#ifndef WLED_DISABLE_WECKER
 #include "wled.h"
 
 /*
@@ -62,7 +63,7 @@ private:
       int wakeM  = alarm["wakeM"]    | 0;
       int offset = alarm["offsetMin"]| 0;
       uint8_t dow = alarm["dow"]     | 127;
-      uint8_t presetId = 240 + idx;
+      uint8_t presetId = alarm["preset"] | 1;
 
       int fireTotal = ((wakeH * 60 + wakeM - offset) % 1440 + 1440) % 1440;
       uint8_t fireH = fireTotal / 60;
@@ -234,3 +235,5 @@ public:
     return present;
   }
 };
+
+#endif // WLED_DISABLE_WECKER

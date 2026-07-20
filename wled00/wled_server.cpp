@@ -51,7 +51,7 @@ static void weckerRebuildTimers() {
     int wakeM   = alarm["wakeM"]    | 0;
     int offset  = alarm["offsetMin"]| 0;
     uint8_t dow = alarm["dow"]      | 127;
-    uint8_t presetId = 240 + idx;
+    uint8_t presetId = alarm["preset"] | 1;
     int fireTotal = ((wakeH * 60 + wakeM - offset) % 1440 + 1440) % 1440;
     uint8_t fireH = fireTotal / 60;
     int8_t  fireM = fireTotal % 60;
@@ -740,6 +740,7 @@ void initServer()
       if (index + len == total) {
         File f = WLED_FS.open(F("/wecker.json"), "w");
         if (f) { f.print(buf); f.close(); }
+        weckerRebuildTimers();
         request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
         buf = "";
       }

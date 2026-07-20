@@ -457,6 +457,7 @@ void checkTimers()
         if (!((t.weekdays >> weekdayMondayFirst()) & 0x01)) continue;
         if (!isTodayInDateRange(t.monthStart, t.dayStart, t.monthEnd, t.dayEnd)) continue;
         applyPreset(t.preset);
+        break;
         #ifdef WLED_DEBUG
         if (t.isSunrise()) DEBUG_PRINTF_P(PSTR("Sunrise timer %d offset %d\n"), t.preset, t.minute);
         else if (t.isSunset()) DEBUG_PRINTF_P(PSTR("Sunset timer %d offset %d\n"), t.preset, t.minute);
