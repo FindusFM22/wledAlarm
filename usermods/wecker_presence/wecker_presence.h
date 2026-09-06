@@ -1,115 +1,362 @@
 #pragma once
 #ifndef WLED_DISABLE_WECKER
 #include "wled.h"
+#include "asyncDNS.h"
 
 /*
- * Wecker Presence Usermod
+ * Wecker Presence Usermod (v2 — eigenständig, non-blocking)
  *
- * Checks if a device (e.g. iPhone) is present on the network via mDNS.
- * If the device is not found shortly before the alarm fires, the alarm
- * timers are disabled so the light does not turn on when nobody is home.
+ * Verwaltet Wecker-Alarme vollständig im RAM, ohne die globale WLED-
+ * Timer-Tabelle zu berühren. wecker.json ist einzige Source of Truth.
+ * Reguläre WLED-Zeitschaltungen bleiben unberührt.
  *
- * Config (stored in cfg.json under "wecker_presence"):
- *   hostname   : mDNS hostname to look for (without .local), e.g. "Findus-mobile"
- *   checkMins  : how many minutes before earliest alarm to run the check (default 10)
- *   enabled    : enable/disable this usermod
+ * Registriert HTTP-Routen: GET /wecker.json, POST /wecker.json, GET /wecker/presence
+ *
+ * Config (cfg.json, Schlüssel "wecker_presence"):
+ *   presenceAddr : IP oder Hostname des zu prüfenden Geräts (feste IP empfohlen!)
+ *   checkMins    : Minuten vor dem frühesten Alarm für Presence-Check (default 10)
+ *   enabled      : Usermod aktiv/inaktiv
+ *
+ * Hinweis: Hostname-Auflösung via AsyncDNS (lwIP unicast) — .local/mDNS wird
+ *   wahrscheinlich NICHT aufgelöst. Feste IP per DHCP-Reservierung verwenden.
+ *   DNS-Fehler sind Fail-safe: Wecker feuert im Zweifel trotzdem.
  */
 
 class WeckerPresenceUsermod : public Usermod {
 private:
+  // ── Alarm-Datenmodell ───────────────────────────────────────────────────────
+  struct WeckerAlarm {
+    uint8_t  wakeH, wakeM;
+    int16_t  offsetMin;   // Vorlauf: Lampe geht offsetMin Minuten VOR Weckzeit an
+    uint8_t  dow;         // Wochentag-Bitmaske: bit0=Mo..bit6=So; 0 = einmalig
+    uint8_t  preset;
+    bool     enabled;
+  };
+  static const uint8_t MAX_ALARMS = 16;
+  WeckerAlarm  alarms[MAX_ALARMS];
+  uint8_t      alarmCount   = 0;
+  volatile bool alarmsDirty = true;   // POST-Handler setzt true → loadAlarms() im loop
+
+  // ── Timer-Tick ──────────────────────────────────────────────────────────────
+  int8_t  lastCheckedMinute = -1;     // wie lastTimerMinute in ntp.cpp:431
+  bool    checkTriggeredToday = false;
+  bool    armNightlight = false;
+  uint8_t armPreset     = 0;
+
+  // ── Presence State-Machine ──────────────────────────────────────────────────
+  enum PState : uint8_t { PS_IDLE, PS_RESOLVING, PS_CONNECTING, PS_DONE };
+  PState   pState     = PS_IDLE;
+  uint32_t pStateSince = 0;
+  uint8_t  pRetries   = 0;
+  static const uint8_t  PRESENCE_RETRIES     = 2;
+  static const uint32_t PRESENCE_DNS_TIMEOUT = 5000;   // ms
+  static const uint32_t PRESENCE_TCP_TIMEOUT = 1500;   // ms
+  static const uint32_t PRESENCE_RETRY_DELAY = 1000;   // ms zwischen Retries
+  static const uint16_t PRESENCE_TCP_PORT    = 62078;
+
+  bool      lastPresent    = true;
+  bool      presenceSuppress = false;    // In-RAM: unterdrückt Feuern, KEIN cfg-Write
+  bool      checkRequested = false;
+
+  IPAddress                 targetIP;
+  std::shared_ptr<AsyncDNS> dnsQuery;
+  AsyncClient*              presenceClient = nullptr;
+  uint32_t                  retryAfter     = 0;   // millis-Timestamp für Retry-Verzögerung
+
+  // ── Config ──────────────────────────────────────────────────────────────────
   static const char _name[];
+  bool    enabled   = true;
+  char    presenceAddr[64] = "";   // feste IP oder Hostname (kein .local)
+  uint8_t checkMins = 10;
 
-  bool     enabled       = true;
-  char     hostname[64]  = "Findus-mobile";
-  uint8_t  checkMins     = 10;   // check this many minutes before earliest alarm
+  // ── Interne Hilfsfunktionen ─────────────────────────────────────────────────
 
-  bool     lastPresent    = true;
-  bool     checkedToday   = false;
-  bool     checkRequested = false;
-  bool     nlStarted      = false;
-  uint8_t  lastPreset     = 0;
+  // Fire-Zeit eines Alarms in Minuten seit Mitternacht
+  static int fireMinute(const WeckerAlarm& a) {
+    return (((int)a.wakeH * 60 + a.wakeM - a.offsetMin) % 1440 + 1440) % 1440;
+  }
 
-  // Find the earliest fire time (in minutes since midnight) across all enabled timers
-  int earliestTimerMinute() {
-    int earliest = -1;
-    for (const auto& t : timers) {
-      if (!t.isEnabled()) continue;
-      int m = t.hour * 60 + t.minute;
+  // Frühester Fire-Zeitpunkt heute (−1 wenn kein heutiger aktiver Alarm)
+  int earliestFireMinuteToday() const {
+    byte todayIdx = weekdayMondayFirst() - 1;   // 0=Mo..6=So
+    int  earliest = -1;
+    for (uint8_t i = 0; i < alarmCount; i++) {
+      const WeckerAlarm& a = alarms[i];
+      if (!a.enabled) continue;
+      if (a.dow != 0 && !((a.dow >> todayIdx) & 1)) continue;
+      int m = fireMinute(a);
       if (earliest < 0 || m < earliest) earliest = m;
     }
     return earliest;
   }
 
-  // Disable all WLED timers (called when nobody is home)
-  void disableTimers() {
-    clearTimers();
-    configNeedsWrite = true;
+  // Spätester Fire-Zeitpunkt heute (für Reset-Fenster nach Alarmen)
+  int lastFireMinuteToday() const {
+    byte todayIdx = weekdayMondayFirst() - 1;
+    int  latest   = -1;
+    for (uint8_t i = 0; i < alarmCount; i++) {
+      const WeckerAlarm& a = alarms[i];
+      if (!a.enabled) continue;
+      if (a.dow != 0 && !((a.dow >> todayIdx) & 1)) continue;
+      int m = fireMinute(a);
+      if (m > latest) latest = m;
+    }
+    return latest;
   }
 
-  // Re-enable timers from wecker.json
-  void rebuildTimers() {
+  // Alarme aus wecker.json in RAM-Cache laden
+  void loadAlarms() {
+    alarmCount = 0;
     if (!WLED_FS.exists(F("/wecker.json"))) return;
     File f = WLED_FS.open(F("/wecker.json"), "r");
     if (!f) return;
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(4096);
     if (deserializeJson(doc, f)) { f.close(); return; }
     f.close();
-
-    clearTimers();
-    int idx = 0;
     for (JsonObject alarm : doc.as<JsonArray>()) {
-      if (!alarm["enabled"].as<bool>()) continue;
-      int wakeH  = alarm["wakeH"]    | 0;
-      int wakeM  = alarm["wakeM"]    | 0;
-      int offset = alarm["offsetMin"]| 0;
-      uint8_t dow = alarm["dow"]     | 127;
-      uint8_t presetId = alarm["preset"] | 1;
-
-      int fireTotal = ((wakeH * 60 + wakeM - offset) % 1440 + 1440) % 1440;
-      uint8_t fireH = fireTotal / 60;
-      int8_t  fireM = fireTotal % 60;
-      uint8_t weekdays = (dow << 1) | 1;
-
-      addTimer(presetId, fireH, fireM, weekdays, 1, 12, 1, 31);
-      idx++;
+      if (alarmCount >= MAX_ALARMS) break;
+      WeckerAlarm& a = alarms[alarmCount];
+      a.wakeH     = alarm["wakeH"]     | 0;
+      a.wakeM     = alarm["wakeM"]     | 0;
+      a.offsetMin = alarm["offsetMin"] | 0;
+      a.dow       = alarm["dow"]       | 127;
+      a.preset    = alarm["preset"]    | 1;
+      a.enabled   = alarm["enabled"]   | false;
+      alarmCount++;
     }
-    configNeedsWrite = true;
+    DEBUG_PRINTF_P(PSTR("[Wecker] Geladen: %d Alarme aus wecker.json\n"), alarmCount);
   }
 
-  bool checkPresence() {
-    // Step 1: resolve hostname via mDNS
-    char fqdn[72];
-    snprintf(fqdn, sizeof(fqdn), "%s.local", hostname);
-    IPAddress ip;
-    if (!WiFi.hostByName(fqdn, ip, 3000)) {
-      DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → not found\n"), fqdn);
-      return false;
-    }
-    DEBUG_PRINTF_P(PSTR("[WeckerPresence] mDNS %s → %s\n"), fqdn, ip.toString().c_str());
+  // Aktuelle alarm[]-Inhalte als wecker.json-kompatibles JSON schreiben
+  // (nur für "einmalig" benötigt; hält dieselbe Reihenfolge und Felder wie das Original)
+  void persistAlarms() {
+    // Wir lesen die Originaldatei und patchen nur das enabled-Feld des passenden Alarms.
+    // Einfachste korrekte Implementierung: Datei neu aufbauen aus RAM-Cache.
+    // Felder die wir nicht im Cache haben (id, label) werden NICHT preserviert — daher
+    // bevorzugen wir den Ansatz, originale JSON-Datei zu lesen und nur zu patchen.
+    if (!WLED_FS.exists(F("/wecker.json"))) return;
+    File rf = WLED_FS.open(F("/wecker.json"), "r");
+    if (!rf) return;
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, rf)) { rf.close(); return; }
+    rf.close();
 
-    // Step 2: try TCP port 62078 three times — iPhone may be in deep sleep
-    for (int attempt = 0; attempt < 3; attempt++) {
-      uint32_t t = millis();
-      WiFiClient client;
-      client.setTimeout(150);
-      client.connect(ip, 62078);
-      uint32_t elapsed = millis() - t;
-      client.stop();
-      DEBUG_PRINTF_P(PSTR("[WeckerPresence] TCP attempt %d: %dms\n"), attempt, elapsed);
-      if (elapsed < 130) return true; // RST came back fast = device present
-      delay(500); // wait before retry
+    // Cache-Index ↔ JSON-Array-Index stimmen überein (beide filtern nicht)
+    uint8_t ci = 0;
+    for (JsonObject alarm : doc.as<JsonArray>()) {
+      if (ci >= alarmCount) break;
+      alarm["enabled"] = alarms[ci].enabled;
+      ci++;
     }
-    return false;
+    File wf = WLED_FS.open(F("/wecker.json"), "w");
+    if (wf) { serializeJson(doc, wf); wf.close(); }
+  }
+
+  // ── Async Presence State-Machine ────────────────────────────────────────────
+
+  enum PresenceResult : uint8_t { PR_PRESENT, PR_ABSENT, PR_UNKNOWN };
+
+  void startPresenceCheck() {
+    if (pState == PS_RESOLVING || pState == PS_CONNECTING) return; // läuft noch
+    pRetries = PRESENCE_RETRIES;
+    pStateSince = millis();
+
+    // Feste IP? Dann direkt verbinden, kein DNS
+    if (targetIP.fromString(presenceAddr)) {
+      DEBUG_PRINTF_P(PSTR("[Wecker] Presence: direkte IP %s\n"), presenceAddr);
+      beginTcpProbe();
+      return;
+    }
+    // Hostname → AsyncDNS (lwIP unicast, .local nicht garantiert)
+    if (presenceAddr[0] != '\0') {
+      DEBUG_PRINTF_P(PSTR("[Wecker] Presence: DNS-Lookup für %s\n"), presenceAddr);
+      dnsQuery = AsyncDNS::query(presenceAddr, dnsQuery);
+      pState = PS_RESOLVING;
+    } else {
+      // Keine Adresse konfiguriert → kein Check, nicht unterdrücken
+      DEBUG_PRINTLN(F("[Wecker] Presence: Adresse nicht konfiguriert, skip"));
+    }
+  }
+
+  // AsyncClient wird EINMAL angelegt und wiederverwendet (Muster hue.cpp:38-46);
+  // niemals delete → keine Lecks, kein Delete-im-Callback.
+  bool ensurePresenceClient() {
+    if (presenceClient) return true;
+    presenceClient = new AsyncClient();
+    if (!presenceClient) return false;
+    presenceClient->onConnect(&sOnTcpConnect, this);
+    presenceClient->onError  (&sOnTcpError,   this);
+    return true;
+  }
+
+  void beginTcpProbe() {
+    if (!ensurePresenceClient()) { finishPresence(PR_UNKNOWN); return; }
+    presenceClient->close();   // No-op wenn nicht verbunden; alte Verbindung sicher beenden
+    pState      = PS_CONNECTING;
+    pStateSince = millis();
+    if (!presenceClient->connect(targetIP, PRESENCE_TCP_PORT)) {
+      finishPresence(PR_UNKNOWN);   // connect() konnte nicht starten → Fail-safe
+    }
+  }
+
+  void finishPresence(PresenceResult r) {
+    if (presenceClient) presenceClient->close();   // Verbindung beenden, Objekt bleibt (Wiederverwendung)
+    pState     = PS_DONE;
+    retryAfter = 0;   // späte Success-Callbacks lösen keinen Nach-Retry aus
+
+    switch (r) {
+      case PR_PRESENT:
+        DEBUG_PRINTLN(F("[Wecker] Presence: zuhause"));
+        presenceSuppress = false;
+        lastPresent = true;
+        break;
+      case PR_ABSENT:
+        DEBUG_PRINTLN(F("[Wecker] Presence: nicht zuhause — Unterdrückung aktiv"));
+        // Fail-safe: nur unterdrücken wenn vorher präsent (bei erstem Boot lastPresent=true)
+        if (lastPresent) presenceSuppress = true;
+        lastPresent = false;
+        break;
+      case PR_UNKNOWN:
+        // DNS-Fehler oder keine Adresse: Wecker feuert trotzdem
+        DEBUG_PRINTLN(F("[Wecker] Presence: unbekannt — feuern trotzdem"));
+        break;
+    }
+    dnsQuery.reset();
+  }
+
+  // Wird jede loop()-Iteration aufgerufen — keine delay()
+  void servicePresence() {
+    if (checkRequested) {
+      checkRequested = false;
+      startPresenceCheck();
+    }
+
+    uint32_t now = millis();
+
+    switch (pState) {
+      case PS_IDLE:
+      case PS_DONE:
+        return;
+
+      case PS_RESOLVING: {
+        if (now - pStateSince > PRESENCE_DNS_TIMEOUT) {
+          DEBUG_PRINTLN(F("[Wecker] Presence: DNS-Timeout → UNKNOWN"));
+          finishPresence(PR_UNKNOWN);
+          return;
+        }
+        if (!dnsQuery) { finishPresence(PR_UNKNOWN); return; }
+        switch (dnsQuery->status()) {
+          case AsyncDNS::result::Success:
+            targetIP = dnsQuery->getIP();
+            DEBUG_PRINTF_P(PSTR("[Wecker] Presence: DNS → %s\n"), targetIP.toString().c_str());
+            beginTcpProbe();
+            break;
+          case AsyncDNS::result::Error:
+            DEBUG_PRINTLN(F("[Wecker] Presence: DNS-Fehler → UNKNOWN"));
+            finishPresence(PR_UNKNOWN);
+            break;
+          default:
+            break; // Busy/Idle → weiter pollen
+        }
+        break;
+      }
+
+      case PS_CONNECTING: {
+        // Watchdog: TCP-Timeout → abwesend (oder retry)
+        if (now - pStateSince > PRESENCE_TCP_TIMEOUT) {
+          DEBUG_PRINTF_P(PSTR("[Wecker] Presence: TCP-Timeout (retry %d)\n"), pRetries);
+          if (pRetries > 0) {
+            pRetries--;
+            if (presenceClient) presenceClient->close();   // wiederverwenden, nicht löschen
+            retryAfter = now + PRESENCE_RETRY_DELAY;
+            pState = PS_DONE;   // kurz pausieren; retryAfter triggert beginTcpProbe neu
+          } else {
+            finishPresence(PR_ABSENT);
+          }
+        }
+        break;
+      }
+    }
+
+    // Retry-Karenz abgelaufen?
+    if (pState == PS_DONE && retryAfter != 0 && now >= retryAfter) {
+      retryAfter = 0;
+      beginTcpProbe();   // direkt mit schon aufgelöster targetIP
+    }
+  }
+
+  // Statische AsyncClient-Callbacks (arg = this)
+  static void sOnTcpConnect(void* arg, AsyncClient*) {
+    WeckerPresenceUsermod* self = static_cast<WeckerPresenceUsermod*>(arg);
+    DEBUG_PRINTLN(F("[Wecker] Presence: TCP connected → präsent"));
+    self->finishPresence(PR_PRESENT);
+  }
+
+  static void sOnTcpError(void* arg, AsyncClient*, int8_t error) {
+    WeckerPresenceUsermod* self = static_cast<WeckerPresenceUsermod*>(arg);
+    uint32_t elapsed = millis() - self->pStateSince;
+    DEBUG_PRINTF_P(PSTR("[Wecker] Presence: TCP error %d nach %ums\n"), error, elapsed);
+    // Schnelles RST (< 300ms) bedeutet: Gerät wach und hat abgelehnt → präsent
+    if (elapsed < 300) {
+      self->finishPresence(PR_PRESENT);
+    } else {
+      if (self->pRetries > 0) {
+        self->pRetries--;
+        if (self->presenceClient) self->presenceClient->close();   // wiederverwenden, nicht löschen
+        self->retryAfter = millis() + PRESENCE_RETRY_DELAY;
+        self->pState = PS_DONE;
+      } else {
+        self->finishPresence(PR_ABSENT);
+      }
+    }
   }
 
 public:
   void setup() override {
-    server.on(F("/wecker/presence"), HTTP_GET, [this](AsyncWebServerRequest *request){
-      // Returns cached result immediately; trigger fresh check for next call
-      checkRequested = true;
-      String resp = lastPresent
-        ? F("{\"present\":true,\"status\":\"zuhause\"}")
-        : F("{\"present\":false,\"status\":\"nicht zuhause\"}");
+    loadAlarms();
+    alarmsDirty = false;
+
+    // ── HTTP-Routen registrieren ──────────────────────────────────────────────
+
+    // GET /wecker.json — Alarmiste ausliefern
+    server.on(F("/wecker.json"), HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (WLED_FS.exists(F("/wecker.json"))) {
+        request->send(WLED_FS, F("/wecker.json"), FPSTR(CONTENT_TYPE_JSON));
+      } else {
+        request->send(200, FPSTR(CONTENT_TYPE_JSON), F("[]"));
+      }
+    });
+
+    // POST /wecker.json — Alarmliste speichern (Body-Streaming, kein String-Puffer-Overread)
+    server.on(F("/wecker.json"), HTTP_POST,
+      [](AsyncWebServerRequest *request){},
+      nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        static File uploadFile;
+        if (index == 0) {
+          uploadFile = WLED_FS.open(F("/wecker.json"), "w");
+        }
+        if (uploadFile) {
+          uploadFile.write(data, len);
+        }
+        if (index + len >= total) {
+          if (uploadFile) { uploadFile.close(); }
+          // Usermod-Singleton reload anstoßen
+          WeckerPresenceUsermod* self = static_cast<WeckerPresenceUsermod*>(
+            UsermodManager::lookup(0xAA01)
+          );
+          if (self) self->alarmsDirty = true;
+          request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
+        }
+      }
+    );
+
+    // GET /wecker/presence — gecachten Presence-Status liefern + frischen Check anstoßen
+    server.on(F("/wecker/presence"), HTTP_GET, [this](AsyncWebServerRequest *request) {
+      checkRequested = true;   // servicePresence() stößt Check in nächster loop-Iteration an
+      const char* resp = lastPresent
+        ? "{\"present\":true,\"status\":\"zuhause\"}"
+        : "{\"present\":false,\"status\":\"nicht zuhause\"}";
       request->send(200, FPSTR(CONTENT_TYPE_JSON), resp);
     });
   }
@@ -117,94 +364,90 @@ public:
   void loop() override {
     if (!enabled) return;
     if (!WLED_CONNECTED) return;
+    if (localTime < 1704067200) return;   // NTP noch nicht synchron (vor 2024-01-01)
 
-    // Reset nlStarted when preset changes so next wecker preset triggers nightlight again
+    // Alarm-Cache bei Bedarf nachladen (nach POST)
+    if (alarmsDirty) {
+      loadAlarms();
+      alarmsDirty = false;
+    }
+
+    // Nightlight-Latch zurücksetzen wenn Preset sich ändert
     if (currentPreset != lastPreset) { nlStarted = false; lastPreset = currentPreset; }
 
-    // On-demand check triggered by HTTP GET /wecker/presence
-    if (checkRequested) {
-      checkRequested = false;
-      lastPresent = checkPresence();
-      if (!lastPresent) disableTimers(); else rebuildTimers();
-      return;
-    }
+    // Presence State-Machine vorwärts treiben (non-blocking)
+    servicePresence();
 
-    if (timers.empty()) return;
+    // Minuten-Tick (genau einmal pro Minute)
+    byte curMin = minute(localTime);
+    if (curMin == (byte)lastCheckedMinute) return;
+    lastCheckedMinute = (int8_t)curMin;
 
-    // Find the next alarm that will fire today (or tomorrow if past midnight)
-    int earliest = earliestTimerMinute();
-    if (earliest < 0) return;
+    int nowMin    = (int)hour(localTime) * 60 + curMin;
+    byte todayIdx = weekdayMondayFirst() - 1;   // 0=Mo..6=So
 
-    int nowMin = hour(localTime) * 60 + minute(localTime);
-    int target = earliest - checkMins;
-    if (target < 0) target = 0;
-
-    // Only check once per alarm — reset when we pass the alarm time
-    if (nowMin > earliest + 2) {
-      checkedToday = false; // reset after alarm fired, ready for next day
-    }
-
-    if (checkedToday) return;
-
-    // Fire within a 1-minute window before the alarm
-    if (nowMin < target || nowMin > target + 1) return;
-
-    checkedToday = true;
-    bool present = checkPresence();
-
-    if (!present) {
-      // Only disable if previously present — fail-safe: keep timers on doubt
-      if (lastPresent) {
-        // Double-check with a second pass before disabling
-        delay(2000);
-        present = checkPresence();
+    // Presence-Check checkMins vor frühestem heutigen Alarm anstoßen
+    int earliest = earliestFireMinuteToday();
+    if (earliest >= 0 && !checkTriggeredToday) {
+      int target = earliest - (int)checkMins;
+      if (target < 0) target = 0;
+      if (nowMin == target) {
+        startPresenceCheck();
+        checkTriggeredToday = true;
       }
-      if (!present && lastPresent) {
-        DEBUG_PRINTLN(F("[WeckerPresence] Not home — disabling timers"));
-        disableTimers();
-      }
-    } else if (present && !lastPresent) {
-      DEBUG_PRINTLN(F("[WeckerPresence] Home again — rebuilding timers"));
-      rebuildTimers();
     }
-    lastPresent = present;
+    // Reset: nach dem letzten Alarm des Tages checkTriggeredToday und Suppress zurücksetzen
+    int latest = lastFireMinuteToday();
+    if (latest < 0 || nowMin > latest + 2) {
+      checkTriggeredToday = false;
+      presenceSuppress    = false;
+    }
+
+    // Feuer-Scan
+    if (presenceSuppress) return;   // niemand zuhause
+
+    for (uint8_t i = 0; i < alarmCount; i++) {
+      WeckerAlarm& a = alarms[i];
+      if (!a.enabled) continue;
+      if (a.dow != 0 && !((a.dow >> todayIdx) & 1)) continue;   // Wochentag prüfen
+      if (fireMinute(a) != nowMin) continue;
+
+      // Alarm feuert
+      armNightlight = true;
+      armPreset     = a.preset;
+      applyPreset(a.preset);   // deferred (handlePresets im selben Loop-Durchlauf)
+      DEBUG_PRINTF_P(PSTR("[Wecker] Alarm feuert: preset=%d um %02d:%02d\n"),
+                     a.preset, (uint8_t)(nowMin/60), (uint8_t)(nowMin%60));
+
+      // "Einmalig" (dow==0): nach dem Feuern deaktivieren + persistieren
+      if (a.dow == 0) {
+        a.enabled = false;
+        persistAlarms();
+        alarmsDirty = false;   // wir haben gerade selbst persistiert
+      }
+      break;   // ein Preset pro Tick (wie checkTimers ntp.cpp:460)
+    }
   }
 
-  // Called after a preset is applied — start nightlight if it's a wecker preset
-  void onStateChange(uint8_t mode) override {
-    if (!enabled) return;
-    if (currentPreset <= 0 || nlStarted) return;
-    if (!WLED_FS.exists(F("/wecker.json"))) return;
-
-    File wf = WLED_FS.open(F("/wecker.json"), "r");
-    if (!wf) return;
-    DynamicJsonDocument doc(2048);
-    bool isWecker = false;
-    if (!deserializeJson(doc, wf)) {
-      for (JsonObject alarm : doc.as<JsonArray>()) {
-        if (alarm["enabled"].as<bool>() && (alarm["preset"] | 0) == currentPreset) {
-          isWecker = true; break;
-        }
-      }
-    }
-    wf.close();
-
-    if (isWecker) {
-      nightlightActive    = true;
-      nightlightActiveOld = false;
-      nightlightDelayMins = 60;
-      nightlightMode      = NL_MODE_FADE;
-      nightlightTargetBri = 0;
-      nlStarted = true;
-      DEBUG_PRINTLN(F("[WeckerPresence] Wecker preset fired — starting 60min nightlight"));
-    }
+  // Nightlight starten wenn das von uns gefeuerte Preset angewandt wird
+  void onStateChange(uint8_t /* mode */) override {
+    if (!enabled || !armNightlight) return;
+    if (currentPreset != armPreset) return;   // nicht unser Preset
+    nightlightActive    = true;
+    nightlightActiveOld = false;
+    nightlightDelayMins = 60;
+    nightlightMode      = NL_MODE_FADE;
+    nightlightTargetBri = 0;
+    armNightlight = false;
+    nlStarted     = true;
+    DEBUG_PRINTLN(F("[Wecker] Nightlight gestartet (60 min fade-out)"));
   }
 
   void addToConfig(JsonObject& root) override {
     JsonObject top = root.createNestedObject(FPSTR(_name));
-    top["enabled"]   = enabled;
-    top["hostname"]  = hostname;
-    top["checkMins"] = checkMins;
+    top["enabled"]     = enabled;
+    top["presenceAddr"] = presenceAddr;
+    top["checkMins"]   = checkMins;
   }
 
   bool readFromConfig(JsonObject& root) override {
@@ -212,8 +455,12 @@ public:
     if (top.isNull()) return false;
     getJsonValue(top["enabled"],   enabled);
     getJsonValue(top["checkMins"], checkMins);
-    if (top["hostname"].is<const char*>())
-      strlcpy(hostname, top["hostname"].as<const char*>(), sizeof(hostname));
+    // Migration: alter Schlüssel "hostname" → presenceAddr
+    if (top["presenceAddr"].is<const char*>()) {
+      strlcpy(presenceAddr, top["presenceAddr"].as<const char*>(), sizeof(presenceAddr));
+    } else if (top["hostname"].is<const char*>()) {
+      strlcpy(presenceAddr, top["hostname"].as<const char*>(), sizeof(presenceAddr));
+    }
     return true;
   }
 
@@ -226,14 +473,12 @@ public:
 
   uint16_t getId() override { return 0xAA01; }
 
-  // Public for on-demand test via HTTP
-  bool testNow() {
-    bool present = checkPresence();
-    lastPresent = present;
-    if (!present) disableTimers();
-    else rebuildTimers();
-    return present;
-  }
+private:
+  // Für Nightlight-Latch (wie bisher)
+  uint8_t lastPreset = 0;
+  bool    nlStarted  = false;
 };
+
+// _name[] wird in wecker_presence.cpp definiert (ODR: genau eine Übersetzungseinheit).
 
 #endif // WLED_DISABLE_WECKER

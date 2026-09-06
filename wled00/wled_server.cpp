@@ -34,53 +34,8 @@ static AsyncWebHandler *editHandler = nullptr;
 static String messageHead, messageSub;
 static byte optionType;
 
-#ifndef WLED_DISABLE_WECKER
-// Helper: rebuild WLED timers from wecker.json
-static void weckerRebuildTimers() {
-  if (!WLED_FS.exists(F("/wecker.json"))) return;
-  File f = WLED_FS.open(F("/wecker.json"), "r");
-  if (!f) return;
-  DynamicJsonDocument doc(2048);
-  if (deserializeJson(doc, f)) { f.close(); return; }
-  f.close();
-  clearTimers();
-  int idx = 0;
-  for (JsonObject alarm : doc.as<JsonArray>()) {
-    if (!alarm["enabled"].as<bool>()) continue;
-    int wakeH   = alarm["wakeH"]    | 0;
-    int wakeM   = alarm["wakeM"]    | 0;
-    int offset  = alarm["offsetMin"]| 0;
-    uint8_t dow = alarm["dow"]      | 127;
-    uint8_t presetId = alarm["preset"] | 1;
-    int fireTotal = ((wakeH * 60 + wakeM - offset) % 1440 + 1440) % 1440;
-    uint8_t fireH = fireTotal / 60;
-    int8_t  fireM = fireTotal % 60;
-    uint8_t weekdays = (dow << 1) | 1;
-    addTimer(presetId, fireH, fireM, weekdays, 1, 12, 1, 31);
-    idx++;
-  }
-  configNeedsWrite = true;
-}
-
-static void handleWeckerToggle(AsyncWebServerRequest *request, bool enable) {
-  if (!WLED_FS.exists(F("/wecker.json"))) {
-    request->send(404, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"no alarms\"}")); return;
-  }
-  File f = WLED_FS.open(F("/wecker.json"), "r");
-  if (!f) { request->send(500, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"read failed\"}")); return; }
-  DynamicJsonDocument doc(2048);
-  if (deserializeJson(doc, f)) { f.close(); request->send(400, FPSTR(CONTENT_TYPE_JSON), F("{\"error\":\"parse failed\"}")); return; }
-  f.close();
-  const char* id = request->hasParam("id") ? request->getParam("id")->value().c_str() : nullptr;
-  for (JsonObject alarm : doc.as<JsonArray>()) {
-    if (!id || strcmp(alarm["id"].as<const char*>(), id) == 0) alarm["enabled"] = enable;
-  }
-  f = WLED_FS.open(F("/wecker.json"), "w");
-  if (f) { serializeJson(doc, f); f.close(); }
-  weckerRebuildTimers();
-  request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
-}
-#endif // WLED_DISABLE_WECKER
+// Wecker routes (GET/POST /wecker.json, GET /wecker/presence) are registered
+// by WeckerPresenceUsermod::setup(). Only the static page route lives here.
 
 
 // define flash strings once (saves flash memory)
@@ -722,30 +677,7 @@ void initServer()
   server.on(_wecker_htm, HTTP_GET, [](AsyncWebServerRequest *request) {
     handleStaticContent(request, FPSTR(_wecker_htm), 200, FPSTR(CONTENT_TYPE_HTML), PAGE_wecker, PAGE_wecker_length);
   });
-  server.on(F("/wecker/on"),  HTTP_POST, [](AsyncWebServerRequest *request){ handleWeckerToggle(request, true);  });
-  server.on(F("/wecker/off"), HTTP_POST, [](AsyncWebServerRequest *request){ handleWeckerToggle(request, false); });
-  static const char _wecker_json[] PROGMEM = "/wecker.json";
-  server.on(_wecker_json, HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (WLED_FS.exists(F("/wecker.json"))) {
-      request->send(WLED_FS, F("/wecker.json"), FPSTR(CONTENT_TYPE_JSON));
-    } else {
-      request->send(200, FPSTR(CONTENT_TYPE_JSON), F("[]"));
-    }
-  });
-  server.on(_wecker_json, HTTP_POST, [](AsyncWebServerRequest *request){}, nullptr,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-      static String buf;
-      if (index == 0) buf = "";
-      buf += String((char*)data).substring(0, len);
-      if (index + len == total) {
-        File f = WLED_FS.open(F("/wecker.json"), "w");
-        if (f) { f.print(buf); f.close(); }
-        weckerRebuildTimers();
-        request->send(200, FPSTR(CONTENT_TYPE_JSON), F("{\"success\":true}"));
-        buf = "";
-      }
-    }
-  );
+  // /wecker.json (GET+POST) and /wecker/presence are registered by WeckerPresenceUsermod::setup()
 #endif // WLED_DISABLE_WECKER
 
 #ifdef WLED_ENABLE_WEBSOCKETS
