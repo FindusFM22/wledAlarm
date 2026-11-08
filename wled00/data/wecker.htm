@@ -52,7 +52,8 @@
 	</details>
 	<p id="clockStatus" class="muted"></p>
 	<div class="actions small-actions"><a id="timeSettings" href="/settings/time">Time &amp; timezone settings</a><button id="syncTime" type="button">Use browser time</button></div>
-	<section aria-labelledby="alarmsTitle"><h2 id="alarmsTitle">Your alarms</h2><div id="alarmList"></div><p id="emptyHint" hidden>No alarms yet. Tap ＋ to add one.</p></section>
+	<details id="iphoneSync" class="card" hidden><summary>iPhone sync</summary><p id="iphoneSyncState"></p><p id="iphoneSyncDetails" class="muted"></p><p class="muted">One separately managed next wake time. Manual alarms and light settings are never replaced by an iPhone sync. Configure its profile through the local-network API; no token or login is needed.</p></details>
+	<section aria-labelledby="alarmsTitle"><h2 id="alarmsTitle">Manual alarms</h2><div id="alarmList"></div><p id="emptyHint" hidden>No manual alarms yet. Tap ＋ to add one.</p></section>
 	<details class="card"><summary>Recent activity</summary><ol id="events"><li>No activity yet.</li></ol></details>
 	<details class="card"><summary>Phone check log · RAM</summary><p id="logSummary" class="muted">Latest 12 rounds shown; up to 96 retained in RAM.</p><div class="actions"><button id="loadFullLog" type="button">Load full night log</button><button id="showRecentLog" type="button">Show recent</button></div><ol id="probeHistory"><li>No checks yet.</li></ol><p class="muted">Cleared on restart. No flash write per check. Full history is fetched only on request.</p></details>
 	<p class="muted">A light alarm is not a guaranteed wake-up device. With no valid presence confirmation, it stays off.</p>

@@ -25,6 +25,11 @@
 			: 'Phone reply confirmed · automatic start permitted';
 	}
 	const replyMethods = methods => [[8, 'mDNS'], [16, 'ICMP'], [4, 'ARP'], [1, 'Ping'], [2, 'TCP']].filter(([bit]) => methods & bit).map(([, name]) => name).join(' + ');
+	// The managed slot is status-only here: a manual-list save must not own its data.
+	function phoneSyncTitle(phone) {
+		if (phone.storageError) return `iPhone sync · storage error (${phone.storageError})`;
+		return `iPhone sync · ${phone.status}${phone.occurrenceState && phone.occurrenceState !== phone.status ? ` · ${phone.occurrenceState}` : ''}`;
+	}
 	const errorText = {
 		settings_locked: 'Unlock WLED settings first, then try again.',
 		revision_conflict: 'The schedule changed on the device or in another browser. Reload before saving; your draft has not been saved.',
@@ -46,7 +51,7 @@
 		no_active_led_segment: 'Configure an active LED segment in WLED first.'
 	};
 	if (typeof module === 'object' && module.exports) {
-		module.exports = { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle };
+		module.exports = { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle };
 		return;
 	}
 	let config = null, status = null, presets = [], busy = false, polling = false, connectionError = false, editBase = null, editingId = null;
@@ -174,8 +179,14 @@
 
 	function renderStatus() {
 		const next = status.next;
+		const phone = status.iphone;
+		gId('iphoneSync').hidden = !phone?.supported;
+		if (phone?.supported) {
+			gId('iphoneSyncState').textContent = phoneSyncTitle(phone);
+			gId('iphoneSyncDetails').textContent = [phone.wakeLocal && `Wake ${formatDeviceTime(phone.wakeLocal)}`, phone.startLocal && `Light start ${formatDeviceTime(phone.startLocal)}`, phone.capturedLocal && `Last sync ${formatDeviceTime(phone.capturedLocal)}`].filter(Boolean).join(' · ') || 'No iPhone wake time has been synchronized.';
+		}
 		gId('nextTime').textContent = next ? formatDeviceTime(next.wakeLocal) : config?.enabled ? 'No upcoming alarm' : 'Alarms disabled';
-		gId('nextDetails').textContent = next ? `${next.label || 'Light alarm'} · starts ${formatDeviceTime(next.startLocal)} · off ${formatDeviceTime(next.endLocal)}` : 'Add an alarm and configure phone presence to get started.';
+		gId('nextDetails').textContent = next ? `${next.source === 'iphone' ? 'iPhone sync · ' : ''}${next.label || 'Light alarm'} · starts ${formatDeviceTime(next.startLocal)} · off ${formatDeviceTime(next.endLocal)}` : 'Add an alarm and configure phone presence to get started.';
 		const presence = status.presence;
 		gId('presenceState').className = `status-pill ${presence.state}${presence.graceActive ? ' grace' : ''}`;
 		gId('presenceState').textContent = presenceTitle(presence);
@@ -202,7 +213,7 @@
 			checkLog.append(element('li', '', `${formatDeviceTime(check.timeLocal)} · ${check.manual ? 'manual' : 'automatic'} · ${check.udpAttempts} UDP · ${(check.durationMs / 1000).toFixed(1)} sec · ${response}`));
 		}
 		if (!checkLog.children.length) checkLog.append(element('li', '', 'No checks yet.'));
-		gId('clockStatus').textContent = status.clockValid ? `Device time: ${formatDeviceTime(status.deviceLocal)}. Alarms use WLED's timezone settings, not this browser's timezone.` : 'Device time is not set. No automatic alarms can run yet.';
+		gId('clockStatus').textContent = status.clockValid ? `Device time: ${formatDeviceTime(status.deviceLocal)}. Displayed times and manual alarms use WLED's timezone; iPhone sync supplies an explicit UTC instant.` : 'Device time is not set. No automatic alarms can run yet.';
 		const run = status.run;
 		gId('activeRun').hidden = !run.active;
 		const phases = { rising: 'Rising', holding: 'Holding brightness', fading: 'Fading out', snoozed: 'Snoozed', idle: 'Starting' };
@@ -210,7 +221,7 @@
 		gId('runProgress').value = run.progress;
 		const events = gId('events'); events.replaceChildren();
 		const reasons = { started: 'Alarm started', started_with_fallback: 'Preset unavailable: sunrise started', completed: 'Alarm completed', phone_unreachable: 'Skipped/stopped: phone unreachable', presence_unknown: 'Skipped: presence unconfirmed', presence_expired: 'Stopped: presence confirmation expired', overlapping_alarm: 'Skipped: another alarm was running', skipped_manually: 'Next occurrence skipped manually', manual_override: 'Manual light control ended the alarm', stopped: 'Stopped', disabled: 'Alarms disabled', alarm_disabled_or_removed: 'Running alarm disabled or removed', preview_interrupted_by_alarm: 'Preview ended for a scheduled alarm', legacy_migrated: 'Existing alarms migrated', preview_completed: 'Preview completed' };
-		for (const event of status.events || []) events.append(element('li', '', `${formatDeviceTime(event.timeLocal)} · ${reasons[event.reason] || event.reason}`));
+		for (const event of status.events || []) events.append(element('li', '', `${formatDeviceTime(event.timeLocal)} · ${event.source === 'iphone' ? 'iPhone · ' : ''}${reasons[event.reason] || event.reason}`));
 		if (!events.children.length) events.append(element('li', '', 'No activity yet.'));
 		if (status.storageError) message(`Device storage: ${status.storageError}. ${status.configurationValid ? 'The previous confirmed settings were kept; the failed change was not applied.' : 'No automatic start until the configuration is repaired.'}`, true);
 		else if (status.migrationPending) message('Existing alarms are waiting for a valid device time before migration.');
