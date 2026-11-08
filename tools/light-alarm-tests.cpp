@@ -1,6 +1,7 @@
 #include "../usermods/wecker_presence/light_alarm_config.h"
 #include "../usermods/wecker_presence/light_alarm_probe_codec.h"
 #include "../usermods/wecker_presence/light_alarm_log.h"
+#include "../usermods/wecker_presence/light_alarm_sync.h"
 #ifdef LIGHT_ALARM_TEST_COOPERATIVE
 #define ESP8266
 #endif
@@ -378,6 +379,262 @@ void configuration() {
   document["alarms"].as<JsonArray>().add(document["alarms"][0]);
   assert(!parseConfig(document.as<JsonVariantConst>(), parsed, false, error));
 }
+
+// Exercise the actual timestamp parser, not a separate test-side date conversion.
+void syncTimestamps() {
+  SyncTimestamp stamp, equivalent;
+  const char* text = "2026-11-09T07:00:00+01:00";
+  assert(parseSyncTimestamp(text, std::string(text).size(), stamp));
+  assert(stamp.seconds == dateEpoch(20261109) + 6 * 3600 && !stamp.milliseconds);
+  text = "2026-11-09T06:00:00.123Z";
+  assert(parseSyncTimestamp(text, std::string(text).size(), equivalent));
+  assert(equivalent.seconds == stamp.seconds && equivalent.milliseconds == 123);
+  for (const char* valid : {"2024-02-29T12:00:00Z", "2026-11-09T06:00:00.1Z", "2026-11-09T06:00:00.12Z", "2026-11-09T06:00:00.000+14:00", "2026-11-09T06:00:00-12:00"}) {
+    assert(parseSyncTimestamp(valid, std::string(valid).size(), stamp));
+    StaticJsonDocument<256> document;
+    serializeSyncTimestamp(document.to<JsonObject>(), "time", stamp);
+    assert(readSyncTimestamp(document["time"], equivalent));
+    assert(stamp == equivalent);
+  }
+  for (const char* invalid : {"2026-11-09", "2026-11-09T06:00:00", "2026-02-29T06:00:00Z", "2026-11-09T24:00:00Z", "2026-11-09T06:60:00Z", "2026-11-09T06:00:60Z", "2026-11-09T06:00:00.Z", "2026-11-09T06:00:00.1234Z", "2026-11-09T06:00:00-00:00", "2026-11-09T06:00:00+14:01", "2026-11-09T06:00:00+01:60", "2026-11-09T06:00:00Zextra", "2024-01-01T00:00:00+14:00", "2099-12-31T23:59:59-14:00"}) {
+    assert(!parseSyncTimestamp(invalid, std::string(invalid).size(), stamp));
+  }
+  const std::string nul = "{\"time\":\"2026-11-09T06:00:00Z\\u0000ignored\"}";
+  assert(!validSyncJsonEnvelope(nul.c_str(), nul.size()));
+  for (const char* valid : {"{}", " {\"wakeAt\":null}\n", "{\"label\":\"\\\\u0000\"}", "{\"x\":[{\"label\":\"}\\\"\"}]}"}) {
+    assert(validSyncJsonEnvelope(valid, std::string(valid).size()));
+  }
+  for (const char* invalid : {"", "[]", "{", "{\"x\":\"unfinished}", "{}garbage", "{}{}", "{\"x\":\"\\u0000\"}"}) {
+    assert(!validSyncJsonEnvelope(invalid, std::string(invalid).size()));
+  }
+  uint32_t random = 33;
+  for (unsigned sample = 0; sample < 10000; ++sample) {
+    char buffer[32];
+    for (char& byte : buffer) { random = random * 1664525U + 1013904223U; byte = char(random >> 24); }
+    buffer[31] = 0;
+    parseSyncTimestamp(buffer, random % sizeof(buffer), stamp);
+    validSyncJsonEnvelope(buffer, random % sizeof(buffer));
+  }
+}
+
+// A parse/allocation/type failure is never a clear, including an embedded NUL.
+void syncIngress() {
+  const char* error = "";
+  PhoneSyncMessage message;
+  StaticJsonDocument<1024> document;
+  assert(!deserializeJson(document, "{\"capturedAt\":\"2026-11-08T22:15:00.123+01:00\",\"wakeAt\":\"2026-11-09T07:00:00+01:00\"}"));
+  assert(parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  assert(message.capturedAt.milliseconds == 123 && message.wakeAt.seconds == dateEpoch(20261109) + 6 * 3600);
+  document["wakeAt"] = nullptr;
+  assert(parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  assert(!message.wakeAt.seconds);
+  document.remove("wakeAt");
+  assert(!parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  document["wakeAt"] = "";
+  assert(!parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  document["wakeAt"] = false;
+  assert(!parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  document["wakeAt"] = "2026-11-09T07:00:00.001+01:00";
+  assert(!parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  document["wakeAt"] = nullptr;
+  document["brightness"] = 255;
+  assert(!parseSyncMessage(document.as<JsonObjectConst>(), message, error));
+  const std::string nul = "{\"capturedAt\":\"2026-11-08T22:15:00Z\\u0000x\",\"wakeAt\":null}";
+  assert(!validSyncJsonEnvelope(nul.c_str(), nul.size()));
+}
+
+// Model a durable commit by assigning the candidate only after a successful write.
+// Retried and stale messages must preserve the profile, token and execution state.
+void syncOrdering() {
+  const uint32_t now = dateEpoch(20261108) + 21 * 3600;
+  PhoneSyncRecord current, candidate;
+  current.profile.brightness = 77;
+  PhoneSyncMessage message;
+  message.capturedAt = SyncTimestamp(now, 10);
+  message.wakeAt = SyncTimestamp(now + 9 * 3600);
+  SyncDecision decision = stagePhoneSync(current, message, now, false, candidate);
+  assert(decision.code == 503 && !decision.changed && !current.wakeAt.seconds);
+  decision = stagePhoneSync(current, message, now, true, candidate);
+  assert(decision.code == 200 && decision.changed && !candidate.enabled && candidate.profile.brightness == 77);
+  assert(!current.capturedAt.seconds); // Simulated failed store: no assignment to live state.
+  current = candidate;
+  assert(!stagePhoneSync(current, message, now, true, candidate).changed);
+  message.capturedAt.milliseconds = 9;
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 409);
+  message.capturedAt.milliseconds = 10;
+  ++message.wakeAt.seconds;
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 409);
+  --message.wakeAt.seconds;
+  message.capturedAt.milliseconds = 11;
+  assert(stagePhoneSync(current, message, now, true, candidate).changed);
+  current = candidate;
+  current.consumedThrough = current.wakeAt.seconds;
+  current.phase = SyncPhase::Completed;
+  assert(!stagePhoneSync(current, message, message.wakeAt.seconds + 60, false, candidate).changed);
+  message.capturedAt = SyncTimestamp(message.wakeAt.seconds + 60);
+  assert(stagePhoneSync(current, message, message.capturedAt.seconds, true, candidate).changed);
+  current = candidate;
+  assert(current.phase == SyncPhase::Completed && current.consumedThrough == current.wakeAt.seconds);
+  ++message.capturedAt.seconds;
+  message.wakeAt = SyncTimestamp();
+  assert(stagePhoneSync(current, message, message.capturedAt.seconds, true, candidate).changed);
+  current = candidate;
+  const uint32_t watermark = current.consumedThrough;
+  assert(current.phase == SyncPhase::Empty && watermark);
+  ++message.capturedAt.seconds;
+  message.wakeAt = SyncTimestamp(watermark);
+  assert(stagePhoneSync(current, message, message.capturedAt.seconds, true, candidate).code == 409);
+  assert(current.phase == SyncPhase::Empty);
+  current = PhoneSyncRecord();
+  message.capturedAt = SyncTimestamp(now + SYNC_FUTURE_SKEW, 1);
+  message.wakeAt = SyncTimestamp(now + 3600);
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 422);
+  message.capturedAt = SyncTimestamp(now - SYNC_MAX_CAPTURE_AGE - 1);
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 409);
+  message.capturedAt = SyncTimestamp(now);
+  message.wakeAt = SyncTimestamp(now);
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 422);
+  message.wakeAt = SyncTimestamp(now + SYNC_MAX_LOOKAHEAD);
+  assert(stagePhoneSync(current, message, now, true, candidate).changed);
+  ++message.wakeAt.seconds;
+  assert(stagePhoneSync(current, message, now, true, candidate).code == 422);
+}
+
+// A seventeenth managed slot does not change manual capacity or ID ownership.
+// Explicit offset timestamps also retain the second occurrence of the DST hour.
+void syncScheduling() {
+  const uint32_t now = dateEpoch(20261108) + 23 * 3600;
+  Config manual;
+  manual.count = MAX_ALARMS;
+  for (unsigned i = 0; i < MAX_ALARMS; ++i) {
+    snprintf(manual.alarms[i].id, sizeof(manual.alarms[i].id), "manual-%u", i);
+    manual.alarms[i].enabled = false;
+  }
+  strcpy(manual.alarms[0].id, "iphone");
+  PhoneSyncRecord phone, candidate;
+  phone.enabled = true; phone.phase = SyncPhase::Scheduled;
+  phone.capturedAt = SyncTimestamp(now);
+  phone.wakeAt = SyncTimestamp(dateEpoch(20261109) + 10 * 60);
+  Occurrence next = nextCombinedOccurrence(manual, phone, now, UTC);
+  assert(next.index == PHONE_ALARM_INDEX && next.date == 20261109);
+  assert(next.start == dateEpoch(20261108) + 23 * 3600 + 40 * 60);
+  assert(!nextCombinedOccurrence(manual, phone, next.start - 1, UTC, true));
+  assert(nextCombinedOccurrence(manual, phone, next.start, UTC, true));
+  manual.alarms[0].enabled = true;
+  manual.alarms[0].weekdays = 0; manual.alarms[0].date = 20261109; manual.alarms[0].wakeMinute = 10;
+  assert(nextCombinedOccurrence(manual, phone, now, UTC).index == 0); // Manual tie wins, even with identical IDs.
+  assert(nextCombinedOccurrence(manual, phone, now, UTC, false, false).index == PHONE_ALARM_INDEX);
+  assert(nextCombinedOccurrence(manual, phone, now, UTC, false, true, false).index == 0);
+  assert(stagePhoneConsumption(phone, next, candidate));
+  phone = candidate;
+  assert(!phoneSyncOccurrence(phone, next.start, UTC));
+  assert(manual.count == MAX_ALARMS && !manual.alarms[0].lastDate);
+  assert(!stagePhoneConsumption(phone, next, candidate));
+  phone.phase = SyncPhase::Scheduled; phone.consumedThrough = 0;
+  assert(phoneSyncOccurrence(phone, next.wake + LATE_START_SECONDS, UTC));
+  assert(!phoneSyncOccurrence(phone, next.wake + LATE_START_SECONDS + 1, UTC));
+  phone.enabled = false;
+  assert(!phoneSyncOccurrence(phone, now, UTC));
+  phone.enabled = true;
+  manual.enabled = false;
+  assert(!nextCombinedOccurrence(manual, phone, now, UTC));
+  const char* repeated = "2026-10-25T02:30:00+01:00";
+  assert(parseSyncTimestamp(repeated, std::string(repeated).size(), phone.wakeAt));
+  next = phoneSyncOccurrence(phone, dateEpoch(20261025), EU);
+  assert(next.wake == dateEpoch(20261025) + 90 * 60);
+  assert(next.date == 20261025 && euLocal(next.wake) == dateEpoch(20261025) + 150 * 60);
+}
+
+// The same codec is used before NVS commits and on boot; corruption fails closed.
+void syncStorage() {
+  PhoneSyncRecord record, parsed;
+  StaticJsonDocument<2048> document;
+  const char* error = "";
+  serializePhoneSyncRecord(document.to<JsonObject>(), record);
+  assert(parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  record.enabled = true; record.phase = SyncPhase::Skipped;
+  record.capturedAt = SyncTimestamp(dateEpoch(20261108) + 21 * 3600, 123);
+  record.wakeAt = SyncTimestamp(dateEpoch(20261109) + 6 * 3600);
+  record.consumedThrough = record.wakeAt.seconds;
+  serializePhoneSyncRecord(document.to<JsonObject>(), record);
+  std::string encoded;
+  serializeJson(document, encoded);
+  assert(encoded.size() <= 1024 && !deserializeJson(document, encoded));
+  assert(parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  assert(parsed.capturedAt == record.capturedAt && parsed.wakeAt == record.wakeAt && parsed.consumedThrough == record.consumedThrough);
+  assert(!phoneSyncOccurrence(parsed, record.wakeAt.seconds - 1800, UTC));
+  assert(!document.containsKey("token") && !document.containsKey("tokenGeneration"));
+  // Old credential fields are accepted only for migration, never kept or emitted.
+  document["version"] = 1;
+  document["token"] = "obsolete-unused-credential";
+  document["tokenGeneration"] = 5;
+  assert(parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  serializePhoneSyncRecord(document.to<JsonObject>(), parsed);
+  assert(document["version"] == SYNC_VERSION && !document.containsKey("token") && !document.containsKey("tokenGeneration"));
+  assert(parsed.consumedThrough == record.consumedThrough);
+  for (const char* field : {"version", "phase", "consumedThrough"}) {
+    assert(!deserializeJson(document, encoded));
+    document[field] = field == std::string("version") ? 99 : UINT32_MAX;
+    assert(!parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  }
+  assert(!deserializeJson(document, encoded));
+  document["token"] = "unsupported-extra-field";
+  assert(!parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  assert(!deserializeJson(document, encoded));
+  document["phase"] = unsigned(SyncPhase::Scheduled);
+  assert(!parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+  assert(!deserializeJson(document, encoded));
+  document.remove("capturedAt"); document["unknown"] = nullptr;
+  assert(!parsePhoneSyncRecord(document.as<JsonObjectConst>(), parsed, error));
+}
+
+// Profile setup can copy existing light settings, without importing manual ownership.
+void syncProfiles() {
+  Config manual = example();
+  manual.alarms[0].rampMinutes = 45; manual.alarms[0].brightness = 99; manual.alarms[0].lastDate = 20261108;
+  PhoneSyncRecord current, candidate;
+  current.capturedAt = SyncTimestamp(dateEpoch(20261108));
+  current.wakeAt = SyncTimestamp(dateEpoch(20261109));
+  current.phase = SyncPhase::Scheduled;
+  StaticJsonDocument<2048> document;
+  document["revision"] = 0; document["enabled"] = true; document["copyFrom"] = "morning";
+  SyncDecision decision = stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate);
+  assert(decision.code == 200 && decision.changed && candidate.profile.brightness == 99 && candidate.profile.rampMinutes == 45);
+  assert(candidate.profile.weekdays == 0 && !candidate.profile.lastDate && !candidate.profile.date);
+  assert(!strcmp(candidate.profile.id, "iphone") && candidate.wakeAt == current.wakeAt && candidate.capturedAt == current.capturedAt);
+  assert(manual.alarms[0].lastDate == 20261108);
+  current = candidate;
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).code == 409);
+  document["revision"] = current.profileRevision;
+  document.remove("copyFrom");
+  serializeLightProfile(document.createNestedObject("profile"), current.profile);
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).changed);
+  document["profile"]["brightness"] = 256;
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).code == 422);
+  document["profile"]["brightness"] = 99;
+  document["profile"]["holdMin"] = 0; document["profile"]["fadeMin"] = 0;
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).code == 422);
+  document["profile"]["holdMin"] = 30;
+  document["profile"]["lastDate"] = 0;
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).code == 422);
+  document["profile"].remove("lastDate");
+  document["enabled"] = 1;
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), manual, current, candidate).code == 422);
+}
+
+// The deliberate home-LAN access policy has no application credentials or PIN.
+void syncNetwork() {
+  const uint32_t local = 0xC0A8B220, mask = 0xFFFFFF00;
+  assert(localSyncPeer(0xC0A8B22B, local, mask));
+  assert(localSyncPeer(local, local, mask));
+  assert(!localSyncPeer(0xC0A8B32B, local, mask));
+  assert(!localSyncPeer(0x08080808, local, mask));
+  assert(!localSyncPeer(0, local, mask));
+  assert(!localSyncPeer(0xC0A8B22B, 0, mask));
+  assert(!localSyncPeer(0xC0A8B22B, local, 0));
+  assert(!localSyncPeer(0xC0A8B200, local, mask));
+  assert(!localSyncPeer(0xC0A8B2FF, local, mask));
+}
 }
 
 int main(int argc, char** argv) {
@@ -394,6 +651,13 @@ int main(int argc, char** argv) {
   else if (test == "packets") packets();
   else if (test == "atomic") atomics();
   else if (test == "config") configuration();
+  else if (test == "sync-timestamps") syncTimestamps();
+  else if (test == "sync-ingress") syncIngress();
+  else if (test == "sync-ordering") syncOrdering();
+  else if (test == "sync-scheduling") syncScheduling();
+  else if (test == "sync-storage") syncStorage();
+  else if (test == "sync-profile") syncProfiles();
+  else if (test == "sync-network") syncNetwork();
   else return 1;
   std::cout << test << " passed\n";
 }

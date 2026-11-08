@@ -27,12 +27,14 @@ let config = { version: 2, revision: 0, enabled: true, presenceHost: '', alarms:
 let run = { active: false, preview: false, phase: 'idle', progress: 0 };
 let presence = 'unknown', nextError = '', backendAvailable = true, nextJob = 1;
 let confirmationAge = 1, grace = false;
+let phone = null;
 const jobs = new Map();
 const deviceLocal = Date.UTC(2026, 10, 8, 18) / 1000;
 const history = Array.from({ length: 96 }, (_, i) => ({ timeLocal: deviceLocal - i * 900, durationMs: 23000, udpAttempts: 4, replyDelayMs: 22500, methods: 8, manual: true, result: 'reply', error: '' }));
 
 function status() {
 	const alarm = config.alarms.find(item => item.enabled);
+	const phoneNext = phone?.enabled && config.enabled && phone.status === 'scheduled' ? { source: 'iphone', id: 'iphone', label: phone.label, date: 20261109, wakeLocal: phone.wakeLocal, startLocal: phone.startLocal, endLocal: phone.endLocal } : null;
 	return { version: 2, revision: config.revision, enabled: config.enabled, clockValid: true, clockSource: 150,
 		deviceLocal, connected: true, storageError: '', migrationPending: false,
 		presence: { state: presence, ageSeconds: 1, confirmationAgeSeconds: presence === 'present' ? confirmationAge : null,
@@ -40,7 +42,7 @@ function status() {
 			ping: presence === 'present' && !grace, tcp: false, mdns: false, icmp: false, arp: 'no_reply', error: grace ? 'no_response' : '',
 			monitoring: alarm && config.enabled ? 'scheduled' : 'paused', intervalSeconds: alarm && config.enabled ? 900 : 0, nextCheckSeconds: alarm && config.enabled ? 300 : null,
 			historyStored: 96, historyCapacity: 96, historyGeneration: 96, history: history.slice(0, 12) },
-		run, events: [], ...(alarm && config.enabled ? { next: { id: alarm.id, label: alarm.label, date: 20261109, wakeLocal: deviceLocal + 13 * 3600, startLocal: deviceLocal + 12.5 * 3600, endLocal: deviceLocal + 13.5 * 3600 } } : {}) };
+		run, events: [], ...(phone ? { iphone: phone } : {}), ...(alarm && config.enabled ? { next: { id: alarm.id, label: alarm.label, date: 20261109, wakeLocal: deviceLocal + 13 * 3600, startLocal: deviceLocal + 12.5 * 3600, endLocal: deviceLocal + 13.5 * 3600 } } : phoneNext ? { next: phoneNext } : {}) };
 }
 
 const server = http.createServer(async (request, response) => {
@@ -158,6 +160,19 @@ async function waitReady(page) {
 		await second.locator('#deleteAlarm').click();
 		await second.waitForFunction(() => !document.getElementById('alarmEditor').open);
 		assert.equal(config.alarms.length, 0);
+		await second.locator('#masterEnabled').check();
+		await second.waitForFunction(() => document.getElementById('message').textContent === 'Saved on the device.');
+		const manualBeforeSync = JSON.stringify(config);
+		phone = { supported: true, enabled: true, status: 'scheduled', occurrenceState: 'scheduled', label: '<svg onload=alert(1)>', wakeLocal: deviceLocal + 4 * 3600, startLocal: deviceLocal + 3.5 * 3600, endLocal: deviceLocal + 4.5 * 3600, capturedLocal: deviceLocal };
+		await second.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('scheduled'));
+		assert.match(await second.locator('#nextDetails').textContent(), /iPhone sync.*<svg onload=alert\(1\)>/);
+		assert.equal(await second.locator('#nextDetails svg').count(), 0);
+		assert.equal(await second.locator('#alarmList .alarm-item').count(), 0);
+		assert.equal(JSON.stringify(config), manualBeforeSync);
+		phone.status = phone.occurrenceState = 'completed';
+		await second.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('completed'));
+		assert.equal(JSON.stringify(config), manualBeforeSync);
+		assert.equal([...jobs.values()].some(job => job.route.startsWith('/wecker/sync/')), false);
 		assert.deepEqual(errors, []);
 		if (process.env.SCREENSHOT_DIR) {
 			fs.mkdirSync(process.env.SCREENSHOT_DIR, { recursive: true });
@@ -168,7 +183,7 @@ async function waitReady(page) {
 		const missing = await context.newPage(); await missing.goto(url);
 		await missing.waitForFunction(() => document.getElementById('message').classList.contains('error'));
 		assert.equal(await missing.locator('#addAlarm').isDisabled(), true);
-		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, missing backend.');
+		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, independent iPhone status, missing backend.');
 	} finally {
 		if (browser) await browser.close();
 		await new Promise(resolve => server.close(resolve));

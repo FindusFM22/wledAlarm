@@ -4,7 +4,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle } = require('../wled00/data/wecker.js');
+const { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle } = require('../wled00/data/wecker.js');
 
 describe('Light alarm web UI helpers', () => {
 	it('formats midnight offsets without losing their sign', () => {
@@ -43,6 +43,12 @@ describe('Light alarm web UI helpers', () => {
 		assert.match(presenceTitle({ state: 'present', confirmationAgeSeconds: 1500, graceActive: true }), /Last confirmed 25 min ago.*grace/);
 		assert.match(presenceTitle({ state: 'present', confirmationAgeSeconds: 5, graceActive: false }), /reply confirmed/);
 		assert.match(presenceTitle({ state: 'unknown' }), /no automatic start/);
+	});
+	it('distinguishes a disabled managed slot from a synchronized scheduled occurrence', () => {
+		assert.match(phoneSyncTitle({ status: 'disabled', occurrenceState: 'empty' }), /disabled.*empty/);
+		assert.match(phoneSyncTitle({ status: 'disabled', occurrenceState: 'scheduled' }), /disabled.*scheduled/);
+		assert.match(phoneSyncTitle({ status: 'completed', occurrenceState: 'completed' }), /completed/);
+		assert.match(phoneSyncTitle({ storageError: 'sync_storage_failed' }), /storage error/);
 	});
 });
 // AI: end
