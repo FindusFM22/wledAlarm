@@ -4,7 +4,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle } = require('../wled00/data/wecker.js');
+const { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle, phoneRepeatText, phoneAlarmSnapshotKey, parsePhoneAlarmList } = require('../wled00/data/wecker.js');
 
 describe('Light alarm web UI helpers', () => {
 	it('formats midnight offsets without losing their sign', () => {
@@ -49,6 +49,30 @@ describe('Light alarm web UI helpers', () => {
 		assert.match(phoneSyncTitle({ status: 'disabled', occurrenceState: 'scheduled' }), /disabled.*scheduled/);
 		assert.match(phoneSyncTitle({ status: 'completed', occurrenceState: 'completed' }), /completed/);
 		assert.match(phoneSyncTitle({ storageError: 'sync_storage_failed' }), /storage error/);
+	});
+	it('renders server-resolved iPhone weekdays without calculating dates', () => {
+		assert.equal(phoneRepeatText({ repeat: ['Friday', 'Monday', 'Wednesday', 'Tuesday', 'Thursday'] }), 'Mo · Tu · We · Th · Fr');
+		assert.equal(phoneRepeatText({ repeat: [] }), 'No repeat');
+	});
+	it('validates iPhone snapshots before replacing read-only rows', () => {
+		const alarm = { label: '<svg onload=alert(1)>', enabled: true, time: '07:00', repeat: ['Monday'] };
+		const snapshot = alarms => ({ version: 2, supported: true, revision: 1, mode: 'list', capturedAt: '2026-11-08T14:41:09Z', alarms });
+		const valid = snapshot([alarm]);
+		assert.equal(parsePhoneAlarmList(valid), valid);
+		assert.equal(parsePhoneAlarmList(snapshot([])).alarms.length, 0);
+		assert.throws(() => parsePhoneAlarmList(snapshot(Array(33).fill(alarm))), /Invalid iPhone alarm list/);
+		for (const change of [{ enabled: 'Yes' }, { time: '24:00' }, { repeat: 'Monday' }, { repeat: ['Funday'] }, { repeat: ['Monday', 'Monday'] }, { label: 'x'.repeat(33) }]) {
+			assert.throws(() => parsePhoneAlarmList(snapshot([{ ...alarm, ...change }])), /Invalid iPhone alarm list/);
+		}
+		assert.throws(() => parsePhoneAlarmList({ ...valid, alarms: null }), /Invalid iPhone alarm list/);
+		assert.throws(() => parsePhoneAlarmList({ ...valid, mode: 'single' }), /Invalid iPhone alarm list/);
+		assert.throws(() => parsePhoneAlarmList({ ...valid, capturedAt: undefined }), /Invalid iPhone alarm list/);
+	});
+	it('fetches a Clock list again only when its snapshot or mode changes', () => {
+		const phone = { mode: 'list', capturedAt: '2026-11-08T14:41:09Z', revision: 1 };
+		assert.equal(phoneAlarmSnapshotKey(phone), phoneAlarmSnapshotKey({ ...phone, revision: 9 }));
+		assert.notEqual(phoneAlarmSnapshotKey(phone), phoneAlarmSnapshotKey({ ...phone, capturedAt: '2026-11-08T14:42:09Z' }));
+		assert.notEqual(phoneAlarmSnapshotKey(phone), phoneAlarmSnapshotKey({ ...phone, mode: 'single' }));
 	});
 });
 // AI: end

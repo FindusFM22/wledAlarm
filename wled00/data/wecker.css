@@ -41,6 +41,9 @@ input[type=time] { font-size: 48px; text-align: center; }
 .alarm-label { display: block; overflow-wrap: anywhere; }
 .alarm-item.off .alarm-time { color: #999; }
 .alarm-meta { font-size: 12px; color: #bbb; }
+.iphone-alarm .alarm-time { font-size: 30px; }
+.iphone-alarm-state { white-space: nowrap; border-radius: 10px; padding: 6px 10px; font-size: 12px; background: #203c2a; color: #bce8c9; }
+.iphone-alarm-state.disabled { background: #292929; color: #aaa; }
 .preview-button { font-size: 12px; padding: 4px 8px; margin-top: 8px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .weekdays { display: flex; gap: 5px; margin-top: 18px; }

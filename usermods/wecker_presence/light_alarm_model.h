@@ -46,6 +46,7 @@ struct Config {
 
 struct Occurrence {
   uint8_t index = 0;
+  uint8_t phoneIndex = UINT8_MAX; // Optional index within the separately owned iPhone list.
   uint32_t date = 0;
   uint32_t start = 0;
   uint32_t wake = 0;
@@ -319,7 +320,7 @@ inline PresencePolicy presencePolicy(bool enabled, bool validClock, const Occurr
   PresencePolicy policy;
   if (!enabled) return policy;
   if (running) { policy.mode = Monitoring::Running; policy.intervalMs = 10U * 60000U; }
-  else if (validClock && next && next.start <= now + 12U * 3600U) {
+  else if (validClock && next && next.start <= now + 90U * 60U) {
     policy.mode = next.start <= now + 30U * 60U ? Monitoring::BeforeAlarm : Monitoring::Scheduled;
     policy.intervalMs = (policy.mode == Monitoring::BeforeAlarm ? 5U : 15U) * 60000U;
   }

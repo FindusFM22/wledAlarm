@@ -23,7 +23,7 @@ describe('Light alarm firmware logic (native C++)', () => {
 		}
 	});
 	after(() => { if (directory) rmSync(directory, { recursive: true, force: true }); });
-	for (const scenario of ['calendar', 'scheduling', 'dst', 'runner', 'presence', 'monitoring', 'burst', 'log', 'packets', 'config', 'atomic', 'sync-timestamps', 'sync-ingress', 'sync-ordering', 'sync-scheduling', 'sync-storage', 'sync-profile', 'sync-network']) {
+	for (const scenario of ['calendar', 'scheduling', 'dst', 'runner', 'presence', 'monitoring', 'burst', 'log', 'packets', 'config', 'atomic', 'sync-timestamps', 'sync-ingress', 'sync-ordering', 'sync-scheduling', 'sync-storage', 'sync-profile', 'sync-network', 'phone-list-ingress', 'phone-list-ordering', 'phone-list-scheduling', 'phone-list-storage']) {
 		it(scenario, () => execFileSync(executable, [scenario], { stdio: 'pipe' }));
 	}
 	it('ESP8266 cooperative callback operations', () => execFileSync(cooperative, ['atomic'], { stdio: 'pipe' }));

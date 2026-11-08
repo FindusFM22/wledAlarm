@@ -1,4 +1,22 @@
-# Thank you for making WLED better!
+# Contributing to WLED Alarm
+
+This repository maintains alarm-specific changes on top of WLED. Please use [FindusFM22/wledAlarm](https://github.com/FindusFM22/wledAlarm) for issues and changes specific to this project; upstream WLED maintainers are not responsible for this fork's custom behavior.
+
+## Fork-specific checklist
+
+- Read [AGENTS.md](AGENTS.md) and the applicable coding/security instructions before changing firmware or web assets.
+- Keep manual and iPhone alarm ownership separate. Document changes to API modes, storage schemas, restart policy and presence timing.
+- For scheduling/reliability changes, add a failing regression case and the relevant anti-replay/other-alarm countercases before claiming a fix.
+- Run `npm test` separately from firmware/browser builds, rebuild the UI, then compile a board environment containing `wecker_presence`.
+- Never commit local credentials, `platformio_override.ini`, generated UI headers, signed/personalized Shortcuts or build outputs.
+- Use English in source, documentation and commit messages. Retain upstream license and attribution notices.
+- Do not force-push open pull requests or rewrite others' changes.
+
+## Inherited upstream guidance
+
+The guidelines below are retained from WLED. References to the original project, its maintainers and its documentation apply when contributing **upstream**; fork-specific changes belong in this repository. Follow the repository's current branch/PR instructions rather than assuming an upstream branch name is a deployment target.
+
+## Thank you for making WLED better!
 
 WLED is a community-driven project, and every contribution matters! We appreciate your time and effort.
 

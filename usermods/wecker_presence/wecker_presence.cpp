@@ -81,7 +81,7 @@ void WeckerPresenceUsermod::setup() {
   if (!_mutex.begin()) return;
 #ifdef ARDUINO_ARCH_ESP32
   // An opaque, non-secret epoch keeps a reboot's recycled job counter from
-  // confirming an earlier boot's sync. Authentication uses a different token.
+  // confirming an earlier boot's sync. It is not an access credential.
   uint32_t bootParts[2];
   esp_fill_random(bootParts, sizeof(bootParts));
   snprintf(_bootId, sizeof(_bootId), "%08lx%08lx", static_cast<unsigned long>(bootParts[0]), static_cast<unsigned long>(bootParts[1]));
@@ -125,16 +125,19 @@ void WeckerPresenceUsermod::registerRoutes() {
   server.on(F("/wecker/result"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendResult(request); });
   server.on(F("/wecker/log"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendProbeLog(request); });
   // AsyncWebServer also matches descendants of an on() path. Exact filters keep
-  // /profile and /result out of the base sync handler, including on GET requests.
+  // /profile, /alarms and /result out of the base sync handler, including on GET requests.
+  server.on(F("/wecker/sync/iphone/alarms"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendPhoneSnapshot(request, false, true); })
+    .setFilter([](AsyncWebServerRequest* request) { return request->url() == F("/wecker/sync/iphone/alarms"); });
   server.on(F("/wecker/sync/iphone/profile"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendPhoneSnapshot(request, true); })
     .setFilter([](AsyncWebServerRequest* request) { return request->url() == F("/wecker/sync/iphone/profile"); });
   server.on(F("/wecker/sync/iphone/result"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendResult(request, true); })
     .setFilter([](AsyncWebServerRequest* request) { return request->url() == F("/wecker/sync/iphone/result"); });
   server.on(F("/wecker/sync/iphone"), HTTP_GET, [this](AsyncWebServerRequest* request) { sendPhoneSnapshot(request, false); })
     .setFilter([](AsyncWebServerRequest* request) { return request->url() == F("/wecker/sync/iphone"); });
-  for (RequestKind kind : {RequestKind::Config, RequestKind::Control, RequestKind::PhoneProfile, RequestKind::PhoneSync}) {
+  for (RequestKind kind : {RequestKind::Config, RequestKind::Control, RequestKind::PhoneProfile, RequestKind::PhoneSync, RequestKind::PhoneAlarms}) {
     const __FlashStringHelper* path = kind == RequestKind::Config ? F("/wecker.json") :
       kind == RequestKind::Control ? F("/wecker/control") : kind == RequestKind::PhoneSync ? F("/wecker/sync/iphone") :
+      kind == RequestKind::PhoneAlarms ? F("/wecker/sync/iphone/alarms") :
       F("/wecker/sync/iphone/profile");
     AsyncCallbackWebHandler& handler = server.on(path, HTTP_POST,
       [this, kind](AsyncWebServerRequest* request) { enqueue(request, kind); }, nullptr,
@@ -158,7 +161,8 @@ bool WeckerPresenceUsermod::authorize(AsyncWebServerRequest* request, RequestKin
 }
 
 size_t WeckerPresenceUsermod::requestLimit(RequestKind kind) {
-  return kind == RequestKind::Config ? Store::MAX_FILE_SIZE : kind == RequestKind::PhoneProfile ? PhoneSyncStore::MAX_SIZE : 512;
+  return kind == RequestKind::Config ? Store::MAX_FILE_SIZE : kind == RequestKind::PhoneAlarms ? PHONE_LIST_MAX_BODY :
+    kind == RequestKind::PhoneProfile ? 1024 : 512;
 }
 
 // A request owns its bounded upload buffer until ownership transfers to the queue.
@@ -260,6 +264,8 @@ void WeckerPresenceUsermod::sendResult(AsyncWebServerRequest* request, bool phon
     root["profileRevision"] = result.profileRevision;
     root["enabled"] = result.syncEnabled;
     root["status"] = syncPhaseName(result.syncPhase);
+    root["mode"] = result.syncListMode ? "list" : "single";
+    root["alarmCount"] = result.syncAlarmCount;
     serializeSyncTimestamp(root, "capturedAt", result.capturedAt);
     serializeSyncTimestamp(root, "wakeAt", result.wakeAt);
   }
@@ -275,12 +281,14 @@ void WeckerPresenceUsermod::sendResult(AsyncWebServerRequest* request, bool phon
 
 // Both new views use the same credential-free local-subnet policy as sync writes.
 // Neither endpoint offers a way to reset the device-owned ordering markers.
-void WeckerPresenceUsermod::sendPhoneSnapshot(AsyncWebServerRequest* request, bool profile) {
+void WeckerPresenceUsermod::sendPhoneSnapshot(AsyncWebServerRequest* request, bool profile, bool alarms) {
   if (!localSyncRequest(request)) { sendError(request, 403, "local_network_required"); return; }
   AsyncWebServerResponse* response = nullptr;
   {
     LightAlarmGuard guard(_mutex);
-    if (guard) response = request->beginResponse(200, FPSTR(CONTENT_TYPE_JSON), profile ? _profileSnapshot : _phoneSnapshot);
+    if (guard && (!alarms || (_phoneAlarmsPublishedRevision == _phonePublishedRevision.load() && _phoneAlarmsSnapshot.length()))) {
+      response = request->beginResponse(200, FPSTR(CONTENT_TYPE_JSON), alarms ? _phoneAlarmsSnapshot : profile ? _profileSnapshot : _phoneSnapshot);
+    }
   }
   if (!response) { sendError(request, 503, "busy"); return; }
   response->addHeader(F("Cache-Control"), F("no-store"));
@@ -295,6 +303,8 @@ void WeckerPresenceUsermod::finishJob(const Job& job, uint16_t code, const char*
   result.syncRevision = _phone.revision; result.profileRevision = _phone.profileRevision;
   result.capturedAt = _phone.capturedAt; result.wakeAt = _phone.wakeAt; result.syncPhase = _phone.phase;
   result.syncEnabled = _phone.enabled && _config.enabled;
+  result.syncListMode = _phone.listMode;
+  result.syncAlarmCount = _phone.alarmCount;
 }
 
 // Serve no more than 24 entries per request. The full 96-entry RAM history is
@@ -368,15 +378,20 @@ bool WeckerPresenceUsermod::commitCandidate(const char*& error) {
 // without its obsolete fields, and never resume a previously started occurrence.
 void WeckerPresenceUsermod::loadPhoneConfiguration() {
   if (!PhoneSyncStore::supported()) { _phoneLoaded = true; return; }
-  _phoneCandidate = PhoneSyncRecord();
+  // A transient JSON-lock/heap shortage must not reread a large NVS blob every loop.
+  if (_phoneLoadAttempted && millis() - _phoneLastLoadAttempt < 5000) return;
+  _phoneLoadAttempted = true;
+  _phoneLastLoadAttempt = millis();
+  _phoneCandidate.reset();
   const char* error = "";
   bool migration = false;
   if (!_phoneStore.load(_phoneCandidate, migration, error)) {
     _phoneStorageError = error;
-    _phoneLoaded = strncmp(error, "busy", 5) != 0;
+    _phoneLoaded = strcmp(error, "busy") != 0 && strcmp(error, "low_memory") != 0;
     return;
   }
   _phone = _phoneCandidate;
+  _phonePublishedRevision = _phone.revision;
   _phoneLoaded = _phoneValid = true;
   _phoneStorageError = "";
   if (migration || _phone.phase == SyncPhase::Started) {
@@ -391,10 +406,18 @@ void WeckerPresenceUsermod::loadPhoneConfiguration() {
 bool WeckerPresenceUsermod::commitPhoneCandidate(const char*& error, const char* reason) {
   _phoneLastSaveAttempt = millis();
   if (!_phoneStore.save(_phoneCandidate, error)) { _phoneStorageError = error; return false; }
-  const bool cancel = _runner.active() && !_runner.preview() && _runningOccurrence.index == PHONE_ALARM_INDEX &&
-    (!_phoneCandidate.enabled || !(_phoneCandidate.wakeAt == _phone.wakeAt) ||
-      _phoneCandidate.phase == SyncPhase::Empty || _phoneCandidate.phase == SyncPhase::Cancelled);
+  bool cancel = false;
+  if (_runner.active() && !_runner.preview() && _runningOccurrence.index == PHONE_ALARM_INDEX) {
+    cancel = !_phoneCandidate.enabled;
+    if (_runningOccurrence.phoneIndex != UINT8_MAX) {
+      cancel |= !phoneListRetainsOccurrence(_phoneCandidate, _runningPhoneAlarm, _runningOccurrence.date);
+    } else {
+      cancel |= _phoneCandidate.listMode || _phoneCandidate.wakeAt.seconds != _runningOccurrence.wake ||
+        _phoneCandidate.phase == SyncPhase::Empty || _phoneCandidate.phase == SyncPhase::Cancelled;
+    }
+  }
   _phone = _phoneCandidate;
+  _phonePublishedRevision = _phone.revision;
   _phoneStorageError = "";
   if (cancel) stopRunner(reason);
   _lastSchedule = UINT32_MAX;
@@ -403,15 +426,17 @@ bool WeckerPresenceUsermod::commitPhoneCandidate(const char*& error, const char*
 
 // Called with the JSON lock held; every path releases it before NVS or LED access.
 // Only client writes are rate-limited; durable start/stop markers are never delayed.
-uint16_t WeckerPresenceUsermod::processPhoneJob(const Job& job, JsonObjectConst root, const char*& error) {
+uint16_t WeckerPresenceUsermod::processPhoneJob(const Job& job, JsonVariantConst root, const char*& error) {
   SyncDecision decision;
   if (!_phoneValid) { decision.code = 503; decision.error = "sync_configuration_unavailable"; }
   else if (job.kind == RequestKind::PhoneSync) {
     PhoneSyncMessage message;
-    if (!parseSyncMessage(root, message, decision.error)) decision.code = 422;
+    if (!parseSyncMessage(root.as<JsonObjectConst>(), message, decision.error)) decision.code = 422;
     else decision = stagePhoneSync(_phone, message, toki.second(), clockValid(), _phoneCandidate);
+  } else if (job.kind == RequestKind::PhoneAlarms) {
+    decision = stagePhoneAlarmList(root, _phone, toki.second(), clockValid(), WLED_CLOCK, _phoneCandidate);
   } else {
-    decision = stagePhoneProfile(root, _config, _phone, _phoneCandidate);
+    decision = stagePhoneProfile(root.as<JsonObjectConst>(), _config, _phone, _phoneCandidate);
   }
   pDoc->clear();
   releaseJSONBufferLock();
@@ -440,6 +465,12 @@ const Alarm& WeckerPresenceUsermod::occurrenceAlarm(const Occurrence& occurrence
   return occurrence.index == PHONE_ALARM_INDEX ? _phone.profile : _config.alarms[occurrence.index];
 }
 
+// The visual profile is shared, but status and the running curve show Clock's label.
+const char* WeckerPresenceUsermod::occurrenceLabel(const Occurrence& occurrence) const {
+  return occurrence.index == PHONE_ALARM_INDEX && occurrence.phoneIndex < _phone.alarmCount ?
+    _phone.alarms[occurrence.phoneIndex].label : occurrenceAlarm(occurrence).label;
+}
+
 // Keep the source identity in the index sentinel, not an ID string: even a manual
 // alarm named 'iphone' remains manually owned and cannot be deleted by a sync.
 Occurrence WeckerPresenceUsermod::nextScheduled(uint32_t now, bool dueOnly, bool manualAllowed, bool phoneAllowed) const {
@@ -460,12 +491,12 @@ void WeckerPresenceUsermod::processJob() {
   }
   const char* error = "";
   uint16_t code = 200;
-  const bool validEnvelope = job.kind < RequestKind::PhoneSync || validSyncJsonEnvelope(job.body->data(), job.body->total);
+  const bool validEnvelope = job.kind < RequestKind::PhoneSync || validSyncJsonEnvelope(job.body->data(), job.body->total, job.kind == RequestKind::PhoneAlarms);
   const DeserializationError parseError = deserializeJson(*pDoc, job.body->data(), job.body->total,
     DeserializationOption::NestingLimit(8));
-  if (!validEnvelope || parseError || !pDoc->is<JsonObject>()) { code = 400; error = "invalid_json"; }
+  if (!validEnvelope || parseError || (!pDoc->is<JsonObject>() && !(job.kind == RequestKind::PhoneAlarms && pDoc->is<JsonArray>()))) { code = 400; error = "invalid_json"; }
   else if (job.kind >= RequestKind::PhoneSync) {
-    code = processPhoneJob(job, pDoc->as<JsonObjectConst>(), error); // Releases the document before NVS/LED access.
+    code = processPhoneJob(job, pDoc->as<JsonVariantConst>(), error); // Releases the document before NVS/LED access.
     p_free(job.body);
     publishStatus();
     finishJob(job, code, error);
@@ -606,7 +637,7 @@ void WeckerPresenceUsermod::schedule(uint32_t now) {
   // filesystem when execution markers cannot be written. Starting still requires a successful write.
   bool manualAllowed = !_storageError[0] || millis() - _lastSaveAttempt >= 5000;
   bool phoneAllowed = !_phoneStorageError[0] || millis() - _phoneLastSaveAttempt >= 5000;
-  for (uint8_t scanned = 0; scanned <= MAX_ALARMS; ++scanned) {
+  for (uint8_t scanned = 0; scanned <= MAX_ALARMS + MAX_PHONE_ALARMS; ++scanned) {
     Occurrence due = nextScheduled(now, true, manualAllowed, phoneAllowed);
     if (!due) return;
     if (waitForPresence(due, now, _presence.state(millis()), _config.presenceHost[0], _presence.firstCheckPending())) {
@@ -628,13 +659,17 @@ void WeckerPresenceUsermod::schedule(uint32_t now) {
       if (!_candidate.alarms[due.index].weekdays) _candidate.alarms[due.index].enabled = false;
       if (!commitCandidate(error)) { manualAllowed = false; continue; }
     }
-    const Alarm& alarm = occurrenceAlarm(due);
+    Alarm alarm = occurrenceAlarm(due);
+    if (due.index == PHONE_ALARM_INDEX && due.phoneIndex < _phone.alarmCount) {
+      strlcpy(alarm.label, _phone.alarms[due.phoneIndex].label, sizeof(alarm.label));
+    }
     const Presence presence = _presence.state(millis());
     if (_runner.active()) { recordOccurrence(due, "overlapping_alarm", SyncPhase::Skipped); continue; }
     if (presence != Presence::Present) { recordOccurrence(due, presence == Presence::Absent ? "phone_unreachable" : "presence_unknown", SyncPhase::Skipped); continue; }
     if (!_lights.begin(alarm, false, _fallback, error)) { recordOccurrence(due, error, SyncPhase::Skipped); continue; }
     _runner.start(alarm, millis(), (now - due.start) * 1000U);
     _runningOccurrence = due;
+    if (due.phoneIndex < _phone.alarmCount) _runningPhoneAlarm = _phone.alarms[due.phoneIndex];
     _finishReason = "completed";
     recordOccurrence(due, _fallback ? "started_with_fallback" : "started", SyncPhase::Started);
   }
@@ -696,7 +731,8 @@ void WeckerPresenceUsermod::publishConfiguration() {
 // portable between phones; Local values are only for WLED's existing status UI.
 void WeckerPresenceUsermod::serializePhoneStatus(JsonObject root, uint32_t now) const {
   const bool running = _runner.active() && !_runner.preview() && _runningOccurrence.index == PHONE_ALARM_INDEX;
-  const uint32_t wake = _phone.wakeAt.seconds;
+  const Occurrence listNext = _phone.listMode && clockValid() ? nextPhoneListOccurrence(_phone, now, WLED_CLOCK) : Occurrence();
+  const uint32_t wake = running ? _runningOccurrence.wake : _phone.listMode ? listNext.wake : _phone.wakeAt.seconds;
   const uint32_t start = running ? _runningOccurrence.start : wake ? wake - _phone.profile.rampMinutes * 60U : 0;
   const uint32_t end = running ? _runningOccurrence.end : wake ? wake + (_phone.profile.holdMinutes + _phone.profile.fadeMinutes) * 60U : 0;
   const char* state = syncPhaseName(_phone.phase);
@@ -704,11 +740,17 @@ void WeckerPresenceUsermod::serializePhoneStatus(JsonObject root, uint32_t now) 
   else if (!_phoneValid) state = "unavailable";
   else if (!_phone.enabled || !_config.enabled) state = "disabled";
   else if (running) state = "started";
+  else if (_phone.listMode && !clockValid() && _phone.alarmCount) state = "waiting_for_time";
+  else if (_phone.listMode && listNext) state = "scheduled";
+  else if (_phone.listMode && !_phone.alarmCount) state = "empty";
   else if (_phone.phase == SyncPhase::Started) state = "interrupted";
   else if (_phone.phase == SyncPhase::Scheduled && !clockValid()) state = "waiting_for_time";
   else if (_phone.phase == SyncPhase::Scheduled && (now > wake + LATE_START_SECONDS || now >= end)) state = "expired";
   root["version"] = SYNC_VERSION;
   root["source"] = "iphone";
+  root["mode"] = _phone.listMode ? "list" : "single";
+  root["alarmCount"] = _phone.alarmCount;
+  root["maxAlarms"] = MAX_PHONE_ALARMS;
   root["supported"] = PhoneSyncStore::supported();
   root["access"] = "local_ipv4";
   root["configurationValid"] = _phoneValid;
@@ -720,9 +762,9 @@ void WeckerPresenceUsermod::serializePhoneStatus(JsonObject root, uint32_t now) 
   root["status"] = state;
   root["occurrenceState"] = syncPhaseName(_phone.phase);
   root["storageError"] = _phoneStorageError;
-  root["label"] = _phone.profile.label;
+  root["label"] = running ? _runner.alarm().label : listNext ? occurrenceLabel(listNext) : _phone.profile.label;
   serializeSyncTimestamp(root, "capturedAt", _phone.capturedAt);
-  serializeSyncTimestamp(root, "wakeAt", _phone.wakeAt);
+  serializeSyncTimestamp(root, "wakeAt", SyncTimestamp(wake));
   serializeSyncTimestamp(root, "startAt", SyncTimestamp(start));
   serializeSyncTimestamp(root, "endAt", SyncTimestamp(end));
   serializeSyncTimestamp(root, "consumedThrough", SyncTimestamp(_phone.consumedThrough));
@@ -795,7 +837,7 @@ void WeckerPresenceUsermod::publishStatus() {
     if (next) {
       JsonObject item = root.createNestedObject("next");
       item["id"] = occurrenceAlarm(next).id;
-      item["label"] = occurrenceAlarm(next).label;
+      item["label"] = occurrenceLabel(next);
       item["source"] = next.index == PHONE_ALARM_INDEX ? "iphone" : "manual";
       item["date"] = next.date;
       item["startLocal"] = wledUtcToLocal(next.start);
@@ -828,6 +870,22 @@ void WeckerPresenceUsermod::publishStatus() {
   serializeLightProfile(profile.createNestedObject("profile"), _phone.profile);
   _profileBuild = "";
   if (_profileBuild.reserve(measureJson(profile) + 1) && !pDoc->overflowed()) serializeJson(profile, _profileBuild);
+  // Publish the full imported list only on changes, never in the one-second status
+  // payload. A revision mismatch makes a read report busy rather than stale data.
+  String alarmsSnapshot;
+  const bool refreshAlarms = !_phoneAlarmsSnapshot.length() || _phoneAlarmsPublishedRevision != _phone.revision;
+  if (refreshAlarms) {
+    JsonObject list = pDoc->to<JsonObject>();
+    list["version"] = SYNC_VERSION;
+    list["supported"] = PhoneSyncStore::supported();
+    list["revision"] = _phone.revision;
+    list["mode"] = _phone.listMode ? "list" : "single";
+    list["maxAlarms"] = MAX_PHONE_ALARMS;
+    serializeSyncTimestamp(list, "capturedAt", _phone.capturedAt);
+    JsonArray alarms = list.createNestedArray("alarms");
+    for (uint8_t i = 0; i < _phone.alarmCount; ++i) serializePhoneAlarm(alarms.createNestedObject(), _phone.alarms[i]);
+    if (alarmsSnapshot.reserve(measureJson(list) + 1) && !pDoc->overflowed()) serializeJson(list, alarmsSnapshot);
+  }
   releaseJSONBufferLock();
   if (!_statusBuild.length()) return;
   LightAlarmGuard guard(_mutex);
@@ -835,6 +893,10 @@ void WeckerPresenceUsermod::publishStatus() {
     std::swap(_statusSnapshot, _statusBuild);
     if (_phoneBuild.length()) std::swap(_phoneSnapshot, _phoneBuild);
     if (_profileBuild.length()) std::swap(_profileSnapshot, _profileBuild);
+    if (refreshAlarms && alarmsSnapshot.length()) {
+      _phoneAlarmsSnapshot = std::move(alarmsSnapshot);
+      _phoneAlarmsPublishedRevision = _phone.revision;
+    }
   }
 }
 

@@ -2,6 +2,7 @@
 (function () {
 	'use strict';
 	const dayNames = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+	const phoneDayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 	const pad2 = value => String(value).padStart(2, '0');
 	const clone = value => JSON.parse(JSON.stringify(value));
 	const clockTime = minutes => `${pad2(Math.floor(((minutes % 1440) + 1440) % 1440 / 60))}:${pad2(((minutes % 60) + 60) % 60)}`;
@@ -25,10 +26,31 @@
 			: 'Phone reply confirmed · automatic start permitted';
 	}
 	const replyMethods = methods => [[8, 'mDNS'], [16, 'ICMP'], [4, 'ARP'], [1, 'Ping'], [2, 'TCP']].filter(([bit]) => methods & bit).map(([, name]) => name).join(' + ');
-	// The managed slot is status-only here: a manual-list save must not own its data.
+	// Managed iPhone schedules are status-only here: manual-list saves never own them.
 	function phoneSyncTitle(phone) {
 		if (phone.storageError) return `iPhone sync · storage error (${phone.storageError})`;
 		return `iPhone sync · ${phone.status}${phone.occurrenceState && phone.occurrenceState !== phone.status ? ` · ${phone.occurrenceState}` : ''}`;
+	}
+	// Rendering only: dates/recurrence resolution stay on WLED, not in the browser.
+	function phoneRepeatText(alarm) {
+		return alarm.repeat.length ? phoneDayNames.flatMap((day, index) => alarm.repeat.includes(day) ? [dayNames[index]] : []).join(' · ') : 'No repeat';
+	}
+	// Execution/profile revisions do not change the imported Clock snapshot. Avoid
+	// downloading the full list again for every one-second diagnostic state change.
+	const phoneAlarmSnapshotKey = phone => `${phone.mode}:${phone.capturedAt ?? ''}`;
+	// Treat fetched rows as untrusted data; invalid responses never become an empty list.
+	function parsePhoneAlarmList(data) {
+		if (!data || data.version !== 2 || data.supported !== true || !['list', 'single'].includes(data.mode) ||
+			!Number.isInteger(data.revision) || data.revision < 0 || data.revision > 0xffffffff ||
+			!(data.capturedAt === null || (typeof data.capturedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(data.capturedAt))) ||
+			!Array.isArray(data.alarms) || data.alarms.length > 32 || (data.mode === 'single' && data.alarms.length)) throw new Error('Invalid iPhone alarm list.');
+		for (const alarm of data.alarms) {
+			if (!alarm || typeof alarm.label !== 'string' || [...alarm.label].length > 32 || typeof alarm.enabled !== 'boolean' ||
+				typeof alarm.time !== 'string' || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(alarm.time) ||
+				!Array.isArray(alarm.repeat) || alarm.repeat.length > 7 || new Set(alarm.repeat).size !== alarm.repeat.length ||
+				!alarm.repeat.every(day => phoneDayNames.includes(day))) throw new Error('Invalid iPhone alarm list.');
+		}
+		return data;
 	}
 	const errorText = {
 		settings_locked: 'Unlock WLED settings first, then try again.',
@@ -51,11 +73,12 @@
 		no_active_led_segment: 'Configure an active LED segment in WLED first.'
 	};
 	if (typeof module === 'object' && module.exports) {
-		module.exports = { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle };
+		module.exports = { clockTime, dateNumber, dateText, repeatText, presetOptions, newAlarm, formatDeviceTime, presenceTitle, phoneSyncTitle, phoneRepeatText, phoneAlarmSnapshotKey, parsePhoneAlarmList };
 		return;
 	}
 	let config = null, status = null, presets = [], busy = false, polling = false, connectionError = false, editBase = null, editingId = null;
 	let fullLog = null, fullLogGeneration = null;
+	let phoneAlarms = null, phoneAlarmsLoading = false, phoneAlarmsError = '';
 	const editor = gId('alarmEditor');
 	const message = (text, error = false) => { gId('message').textContent = text; gId('message').classList.toggle('error', error); };
 	const explain = error => errorText[error] || `Request failed (${error || 'unknown error'}).`;
@@ -177,13 +200,66 @@
 		}
 	}
 
+	// Imported alarms have no edit, preview or toggle controls: the next Shortcut
+	// upload owns their state, and manual-list saves must never write their data.
+	function renderPhoneAlarms() {
+		const phone = status?.iphone;
+		gId('iphoneAlarms').hidden = !phone?.supported;
+		const list = gId('iphoneAlarmList'); list.replaceChildren();
+		const notice = gId('iphoneAlarmsMessage');
+		notice.classList.toggle('error', !!phoneAlarmsError);
+		gId('iphoneAlarmsCount').textContent = '';
+		if (!phone?.supported) return;
+		if (phone.mode !== 'list' || phoneAlarms?.mode === 'single') {
+			notice.textContent = 'No iPhone alarm list uploaded. Run the list-sync Shortcut.';
+			return;
+		}
+		notice.textContent = phoneAlarmsError ? `Could not refresh iPhone alarms: ${phoneAlarmsError}${phoneAlarms ? ' Showing the last loaded list.' : ''}` :
+			phoneAlarmsLoading ? 'Loading iPhone alarms…' : !phoneAlarms ? 'Waiting for the iPhone alarm list…' :
+			!phoneAlarms.alarms.length ? 'No iPhone alarms in the last synced Clock list.' : '';
+		if (!phoneAlarms) return;
+		const count = phoneAlarms.alarms.length, enabled = phoneAlarms.alarms.filter(alarm => alarm.enabled).length;
+		gId('iphoneAlarmsCount').textContent = `${count} ${count === 1 ? 'alarm' : 'alarms'} · ${enabled} enabled`;
+		for (const alarm of [...phoneAlarms.alarms].sort((a, b) => a.time.localeCompare(b.time) || a.label.localeCompare(b.label))) {
+			const card = element('article', `card alarm-item iphone-alarm${alarm.enabled ? '' : ' off'}`);
+			const content = element('div', 'alarm-content');
+			content.append(element('span', 'alarm-time', alarm.time), element('span', 'alarm-label', alarm.label || 'Alarm'),
+				element('p', 'alarm-meta', phoneRepeatText(alarm)));
+			card.append(content, element('span', `iphone-alarm-state${alarm.enabled ? '' : ' disabled'}`, alarm.enabled ? 'Enabled' : 'Disabled'));
+			list.append(card);
+		}
+	}
+
+	// Fetch only a changed snapshot. A network/parse failure keeps the previous
+	// read-only cards visible with an explicit stale-data notice, never a false clear.
+	async function loadPhoneAlarms() {
+		const phone = status?.iphone;
+		if (!phone?.supported || phone.mode !== 'list') {
+			phoneAlarms = null; phoneAlarmsError = '';
+			renderPhoneAlarms();
+			return;
+		}
+		if (phoneAlarmsLoading || (phoneAlarms && phoneAlarmSnapshotKey(phoneAlarms) === phoneAlarmSnapshotKey(phone))) return;
+		phoneAlarmsLoading = true; phoneAlarmsError = ''; renderPhoneAlarms();
+		try {
+			const { data } = await request('/wecker/sync/iphone/alarms');
+			const parsed = parsePhoneAlarmList(data);
+			if (!status?.iphone?.supported || status.iphone.mode !== 'list') return;
+			phoneAlarms = parsed;
+		} catch (error) {
+			phoneAlarmsError = error.name === 'AbortError' ? 'Connection timed out.' : error.message;
+		} finally {
+			phoneAlarmsLoading = false; renderPhoneAlarms();
+		}
+	}
+
 	function renderStatus() {
 		const next = status.next;
 		const phone = status.iphone;
 		gId('iphoneSync').hidden = !phone?.supported;
 		if (phone?.supported) {
 			gId('iphoneSyncState').textContent = phoneSyncTitle(phone);
-			gId('iphoneSyncDetails').textContent = [phone.wakeLocal && `Wake ${formatDeviceTime(phone.wakeLocal)}`, phone.startLocal && `Light start ${formatDeviceTime(phone.startLocal)}`, phone.capturedLocal && `Last sync ${formatDeviceTime(phone.capturedLocal)}`].filter(Boolean).join(' · ') || 'No iPhone wake time has been synchronized.';
+			gId('iphoneSyncDetails').textContent = [phone.mode === 'list' && `${phone.alarmCount} Clock alarms stored`, phone.wakeLocal && `Wake ${formatDeviceTime(phone.wakeLocal)}`, phone.startLocal && `Light start ${formatDeviceTime(phone.startLocal)}`, phone.capturedLocal && `Last sync ${formatDeviceTime(phone.capturedLocal)}`].filter(Boolean).join(' · ') || 'No iPhone wake time has been synchronized.';
 		}
 		gId('nextTime').textContent = next ? formatDeviceTime(next.wakeLocal) : config?.enabled ? 'No upcoming alarm' : 'Alarms disabled';
 		gId('nextDetails').textContent = next ? `${next.source === 'iphone' ? 'iPhone sync · ' : ''}${next.label || 'Light alarm'} · starts ${formatDeviceTime(next.startLocal)} · off ${formatDeviceTime(next.endLocal)}` : 'Add an alarm and configure phone presence to get started.';
@@ -213,7 +289,7 @@
 			checkLog.append(element('li', '', `${formatDeviceTime(check.timeLocal)} · ${check.manual ? 'manual' : 'automatic'} · ${check.udpAttempts} UDP · ${(check.durationMs / 1000).toFixed(1)} sec · ${response}`));
 		}
 		if (!checkLog.children.length) checkLog.append(element('li', '', 'No checks yet.'));
-		gId('clockStatus').textContent = status.clockValid ? `Device time: ${formatDeviceTime(status.deviceLocal)}. Displayed times and manual alarms use WLED's timezone; iPhone sync supplies an explicit UTC instant.` : 'Device time is not set. No automatic alarms can run yet.';
+		gId('clockStatus').textContent = status.clockValid ? `Device time: ${formatDeviceTime(status.deviceLocal)}. Manual and imported Clock lists use WLED's timezone; legacy single-wake sync uses an explicit UTC instant.` : 'Device time is not set. No automatic alarms can run yet.';
 		const run = status.run;
 		gId('activeRun').hidden = !run.active;
 		const phases = { rising: 'Rising', holding: 'Holding brightness', fading: 'Fading out', snoozed: 'Snoozed', idle: 'Starting' };
@@ -232,6 +308,7 @@
 		const { data } = await request('/wecker/status');
 		if (data.version !== 2 || !data.presence || !data.run) throw new Error('Invalid light alarm status.');
 		status = data; renderStatus();
+		await loadPhoneAlarms();
 	}
 
 	function weekdays() { return [...d.querySelectorAll('[data-day]')].reduce((mask, button) => mask | (button.getAttribute('aria-pressed') === 'true' ? 1 << Number(button.dataset.day) : 0), 0); }

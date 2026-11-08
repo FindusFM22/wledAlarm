@@ -28,6 +28,7 @@ let run = { active: false, preview: false, phase: 'idle', progress: 0 };
 let presence = 'unknown', nextError = '', backendAvailable = true, nextJob = 1;
 let confirmationAge = 1, grace = false;
 let phone = null;
+let phoneAlarms = [], phoneListReadCount = 0, phoneListError = '';
 const jobs = new Map();
 const deviceLocal = Date.UTC(2026, 10, 8, 18) / 1000;
 const history = Array.from({ length: 96 }, (_, i) => ({ timeLocal: deviceLocal - i * 900, durationMs: 23000, udpAttempts: 4, replyDelayMs: 22500, methods: 8, manual: true, result: 'reply', error: '' }));
@@ -54,6 +55,12 @@ const server = http.createServer(async (request, response) => {
 	if (request.method === 'GET') {
 		if (route === '/wecker.json') json(config);
 		else if (route === '/wecker/status') json(status());
+		else if (route === '/wecker/sync/iphone/alarms') {
+			++phoneListReadCount;
+			if (phoneListError) json({ error: phoneListError }, 503);
+			else json({ version: 2, supported: true, revision: phone?.revision || 0, mode: phone?.mode || 'single',
+				capturedAt: phone?.capturedAt || null, alarms: phone?.mode === 'list' ? phoneAlarms : [] });
+		}
 		else if (route === '/wecker/log') {
 			const offset = Number(url.searchParams.get('offset') || 0), limit = Number(url.searchParams.get('limit') || 24);
 			const entries = history.slice(offset, offset + limit);
@@ -163,27 +170,68 @@ async function waitReady(page) {
 		await second.locator('#masterEnabled').check();
 		await second.waitForFunction(() => document.getElementById('message').textContent === 'Saved on the device.');
 		const manualBeforeSync = JSON.stringify(config);
-		phone = { supported: true, enabled: true, status: 'scheduled', occurrenceState: 'scheduled', label: '<svg onload=alert(1)>', wakeLocal: deviceLocal + 4 * 3600, startLocal: deviceLocal + 3.5 * 3600, endLocal: deviceLocal + 4.5 * 3600, capturedLocal: deviceLocal };
+		phone = { supported: true, enabled: true, mode: 'list', alarmCount: 2, revision: 1, capturedAt: '2026-11-08T17:00:00Z', status: 'scheduled', occurrenceState: 'scheduled', label: '<svg onload=alert(1)>', wakeLocal: deviceLocal + 4 * 3600, startLocal: deviceLocal + 3.5 * 3600, endLocal: deviceLocal + 4.5 * 3600, capturedLocal: deviceLocal };
+		phoneAlarms = [
+			{ label: '<svg onload=alert(1)>', enabled: true, time: '07:00', repeat: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'] },
+			{ label: 'Disabled Clock alarm', enabled: false, time: '05:20', repeat: [] }
+		];
 		await second.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('scheduled'));
 		assert.match(await second.locator('#nextDetails').textContent(), /iPhone sync.*<svg onload=alert\(1\)>/);
+		assert.match(await second.locator('#iphoneSyncDetails').textContent(), /2 Clock alarms stored/);
 		assert.equal(await second.locator('#nextDetails svg').count(), 0);
 		assert.equal(await second.locator('#alarmList .alarm-item').count(), 0);
 		assert.equal(JSON.stringify(config), manualBeforeSync);
+		await second.waitForFunction(() => document.querySelectorAll('#iphoneAlarmList .iphone-alarm').length === 2);
+		await page.waitForFunction(() => document.querySelectorAll('#iphoneAlarmList .iphone-alarm').length === 2);
+		assert.equal(await second.locator('#iphoneAlarmList button, #iphoneAlarmList input, #iphoneAlarmList select').count(), 0);
+		assert.equal(await second.locator('#iphoneAlarmList svg').count(), 0);
+		assert.match(await second.locator('#iphoneAlarmList').textContent(), /<svg onload=alert\(1\)>/);
+		assert.match(await second.locator('#iphoneAlarmList').textContent(), /Mo · Tu · We · Th · Fr/);
+		assert.match(await second.locator('#iphoneAlarmList').textContent(), /No repeat/);
+		assert.equal(await second.locator('#iphoneAlarmList .alarm-time').first().textContent(), '05:20');
+		assert.equal(await second.locator('#iphoneAlarmList .iphone-alarm-state.disabled').count(), 1);
+		assert.match(await second.locator('#iphoneAlarmsCount').textContent(), /2 alarms · 1 enabled/);
+		const readsBeforeOutcome = phoneListReadCount;
 		phone.status = phone.occurrenceState = 'completed';
+		++phone.revision;
 		await second.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('completed'));
+		await page.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('completed'));
+		assert.equal(phoneListReadCount, readsBeforeOutcome); // Diagnostic revisions do not refetch the full list.
+		phoneAlarms.push({ label: 'Updated Clock alarm', enabled: true, time: '08:30', repeat: ['Saturday', 'Sunday'] });
+		phone.alarmCount = 3; ++phone.revision; phone.capturedAt = '2026-11-08T17:01:00Z';
+		phoneListError = 'busy';
+		await second.waitForFunction(() => document.getElementById('iphoneAlarmsMessage').textContent.includes('Showing the last loaded list'));
+		assert.equal(await second.locator('#iphoneAlarmList .iphone-alarm').count(), 2);
+		phoneListError = '';
+		await second.waitForFunction(() => document.querySelectorAll('#iphoneAlarmList .iphone-alarm').length === 3);
+		assert.match(await second.locator('#iphoneAlarmList').textContent(), /Updated Clock alarm/);
+		phone.mode = 'single'; phone.alarmCount = 0; ++phone.revision; phone.capturedAt = '2026-11-08T17:02:00Z';
+		await second.waitForFunction(() => document.getElementById('iphoneAlarmsMessage').textContent.includes('No iPhone alarm list uploaded'));
+		assert.equal(await second.locator('#iphoneAlarmList .iphone-alarm').count(), 0);
+		phone.mode = 'list'; ++phone.revision; phone.capturedAt = '2026-11-08T17:03:00Z'; phoneAlarms = [];
+		await second.waitForFunction(() => document.getElementById('iphoneAlarmsMessage').textContent.includes('No iPhone alarms in the last synced Clock list'));
+		assert.equal(await second.locator('#iphoneAlarmList .iphone-alarm').count(), 0);
 		assert.equal(JSON.stringify(config), manualBeforeSync);
 		assert.equal([...jobs.values()].some(job => job.route.startsWith('/wecker/sync/')), false);
 		assert.deepEqual(errors, []);
 		if (process.env.SCREENSHOT_DIR) {
 			fs.mkdirSync(process.env.SCREENSHOT_DIR, { recursive: true });
-			await page.evaluate(() => window.scrollTo(0, 0));
-			await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'light-alarm-mobile.png'), fullPage: true });
+			phone.status = phone.occurrenceState = 'scheduled'; phone.alarmCount = 2; ++phone.revision; phone.capturedAt = '2026-11-08T17:04:00Z';
+			phoneAlarms = [
+				{ label: 'Work', enabled: true, time: '07:00', repeat: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'] },
+				{ label: 'Backup', enabled: false, time: '07:30', repeat: [] }
+			];
+			const preview = await context.newPage();
+			await preview.goto(url); await waitReady(preview);
+			await preview.waitForFunction(() => document.querySelectorAll('#iphoneAlarmList .iphone-alarm').length === 2);
+			await preview.locator('#presenceSetup').evaluate(item => { item.open = false; });
+			await preview.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'light-alarm-mobile.png'), fullPage: true });
 		}
 		backendAvailable = false;
 		const missing = await context.newPage(); await missing.goto(url);
 		await missing.waitForFunction(() => document.getElementById('message').classList.contains('error'));
 		assert.equal(await missing.locator('#addAlarm').isDisabled(), true);
-		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, independent iPhone status, missing backend.');
+		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, read-only iPhone list, snapshot caching/recovery, missing backend.');
 	} finally {
 		if (browser) await browser.close();
 		await new Promise(resolve => server.close(resolve));

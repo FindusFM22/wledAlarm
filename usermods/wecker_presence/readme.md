@@ -39,8 +39,8 @@ Checks are bounded, non-blocking and confined to the ESP's own IPv4 subnet. All 
 
 | Situation | Automatic check interval |
 |---|---|
-| No enabled alarm starting within 12 hours, or clock not initialized | Paused |
-| Alarm starting within 12 hours | 15 minutes |
+| No enabled alarm starting within 90 minutes, or clock not initialized | Paused |
+| Alarm starting within 90 minutes | 15 minutes |
 | Last 30 minutes before light start | 5 minutes |
 | Automatic alarm running, including snooze | 10 minutes |
 | Manual check or changing the phone IP | Immediate when idle; coalesced with an in-flight round, with a 5-second rate limit |
@@ -102,11 +102,67 @@ Legacy array-format files are migrated after a valid clock is available. IDs, la
 
 Manual configuration writes and `/wecker/control` commands retain WLED's configured settings PIN policy. A POST returns **202 with a job ID**, not a premature success. Poll the result until it is no longer 202: 200 confirms completion, 409 indicates a revision/operation conflict, and invalid input or storage errors are rejected. Only after a confirmed save should a client replace its local configuration. The browser refreshes revisions and does not silently overwrite another browser's changes. Raw file-editor modifications are not hot-reloaded; use the API/UI.
 
+## iPhone alarm-list sync (ESP32)
+
+The recommended iPhone interface receives the **whole normal Clock alarm list**. WLED owns enabled-state filtering, weekday interpretation, one-shot date selection, DST resolution and all subsequent scheduling. The Shortcut only reads and uploads data; it does not select the earliest alarm or calculate tomorrow's date. Follow the [English action-by-action Shortcut guide](iphone-shortcut.md) for the tested list-building workflow.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /wecker/sync/iphone/alarms` | Atomically replace the independently managed iPhone list. |
+| `GET /wecker/sync/iphone/alarms` | Read the stored list in canonical Clock-compatible form. |
+| `GET /wecker/sync/iphone` | Read readiness, list count, current/next occurrence and storage status. |
+
+The simplest request is a JSON array, with **no timestamp or configuration revision**:
+
+```json
+[
+  {"label":"Work","enabled":true,"time":"07:00","repeat":["Monday","Tuesday","Wednesday","Thursday","Friday"]},
+  {"label":"Weekend","enabled":true,"time":"08:30","repeat":"Weekends"},
+  {"label":"Backup","enabled":false,"time":"06:00","repeat":"Daily"},
+  {"label":"Appointment","enabled":true,"time":"09:15","repeat":[]}
+]
+```
+
+`{"alarms":[...]}` is accepted too, making it easy to use Shortcuts' JSON request-body editor. A minimal native action flow is:
+
+1. **Find Alarms** (or **Get All Alarms**), without filtering or limiting the results.
+2. **Repeat with Each**: format its **Time** as `HH:mm` and create a **Dictionary** containing `label`, `enabled`, `time`, and `repeat` from the Clock properties **Label**, **Is Enabled**, **Time**, and **Repeat**.
+3. **Get Contents of URL**, **POST** to `http://<wled-ip>/wecker/sync/iphone/alarms`, JSON body with `alarms` set to **Repeat Results**. No date arithmetic, weekday conversion, label matching or enabled-state If blocks are needed.
+
+The **iPhone alarms** section on `/wecker.htm` displays the stored Clock list separately from manual alarms: label, local time, repeat weekdays and enabled/disabled status. It is read-only; edit on the phone and sync again. The full list is fetched when its capture/mode changes, not on every status tick. A failed refresh retains the previous rows with an explicit last-loaded-list notice.
+
+These are data mappings, not a guarantee that every iOS version exposes the same Clock properties. Verify them on the actual phone. Do not substitute an assumed enabled state or an empty list when Clock access fails. The existing generated files in `tools/ios-shortcuts` remain legacy single-wake clients, not list-upload clients.
+
+### List fields and scheduling
+
+- At most **32 alarms** and **12,000 request bytes** are accepted on ESP32. Each entry must contain exactly the four fields above; malformed entries reject the entire upload and retain the previous confirmed list.
+- `label`: a string of at most 32 UTF-8 characters; `null` means unlabelled. Labels need not be unique and do **not** need to contain `WLED`. All supplied enabled alarms qualify.
+- `enabled`: a JSON boolean, `0`/`1`, or normal case-insensitive Clock text (`true`/`false`, `yes`/`no`, `on`/`off`, `enabled`/`disabled`, `ja`/`nein`). Unknown states are rejected rather than guessed.
+- `time`: local 24-hour `HH:mm`, interpreted in **WLED's configured timezone**. Keep the phone and WLED timezones aligned for home use.
+- `repeat`: an array of English/German weekday names or abbreviations, a Clock summary (`Daily`, `Weekdays`, `Weekends`, `Never` and German equivalents), or a Monday-based bitmask `0`–`127`. An explicit empty array, empty string or `null` means no repeat. Unknown repeat formats are rejected.
+- Non-repeating alarms receive today's or tomorrow's next date when the snapshot is accepted. That resolved date stays fixed: the same stored one-shot never becomes a daily alarm.
+- Recurring alarms continue to their next weekdays **without another upload**. Only changes made in Clock require another upload; an App → Clock → Is Closed automation is a useful trigger. The Health/Sleep schedule is not imported.
+- WLED's existing DST policy applies: a missing spring-forward time moves forward by the one-hour gap; the repeated fall-back hour uses its first occurrence. Keep the iPhone's acoustic alarm as the primary wake-up device and physically test DST/locked-phone behavior.
+- Simultaneous iPhone alarms share one light occurrence. Execution/skip markers are committed before LEDs start, survive reboot, and are carried across label/repeat edits. A reboot never resumes a consumed occurrence.
+- Uploading `[]` or `{"alarms":[]}` explicitly clears only the iPhone list and stops its running curve. Missing/null/invalid `alarms`, read errors and transport errors are **not** clears. A changed list retains a running curve if it still enables that local time/date; removing/disabling it stops the curve.
+
+List mode uses the existing independent iPhone light profile, master switch and phone-presence policy. Uploading a list does not enable the profile or rewrite its light settings. Enable/configure it once through the [profile API below](#profile-setup). Manual alarms, their revision, pins, LEDs and router configuration remain untouched.
+
+The list route has the same credential-free **direct local IPv4-subnet** restriction as the other iPhone routes. Both request forms return **202 with `job`, `confirmed:false` and `resultUrl`**, not a premature save confirmation. Follow `resultUrl` until `confirmed:true`/HTTP 200, or check the alarm page; do not announce a successful save based only on 202. Writes retain the one-per-second rate limit. The status reports `mode:"list"`, `alarmCount` and the current/next `wakeAt`/`startAt`; the full list is fetched separately, not included in every status tick.
+
+For simple requests, WLED stamps the snapshot on arrival. Every POST represents a **fresh Clock reading**; after a network timeout, read status or re-read Clock before another upload. Clients needing explicit stale-update protection and idempotent retries can optionally send `{"capturedAt":"<RFC 3339>","alarms":[...]}`. Capture that timestamp before reading Clock. Equivalent lists are order-independent, and exact timestamped retries never reset one-shot dates or consumption markers. The 24-hour capture-age limit applies only when accepting an update, not to the lifetime of a stored recurring list.
+
+**Mode compatibility:** A successful list upload replaces a previous managed single wake. A later successful legacy single-wake POST switches back to single mode and replaces the list; do not run both client types concurrently. Manual alarms are not affected. List records use NVS schema version 3; single mode continues writing the existing version-2 schema. Before downgrading to firmware without list support, clear/switch back using the legacy `wakeAt:null` request so the old firmware can read the single-mode record.
+
 ## iPhone next-wake sync (ESP32)
+
+This legacy interface remains supported. New native clients should prefer the [alarm-list interface](#iphone-alarm-list-sync-esp32) above so scheduling stays on WLED.
 
 This is a separate **single, one-shot slot**, in addition to the 16 manual alarms. It accepts an explicit next wake instant, not an Apple alarm ID or the complete Clock alarm list. The server does not assume that a particular iOS version exposes enabled status, a next-occurrence date, or the Health sleep schedule. Verify those capabilities on the actual phone before relying on a Shortcut to choose the correct occurrence.
 
 The feature is **disabled after installation**. Existing manual alarms, their revision, phone target, presets and LED configuration are unchanged. Manual alarms remain active until you deliberately disable them. Both sources share the existing presence checks and one light runner; a manual alarm wins an exact start-time tie, and overlaps are consumed rather than replayed.
+
+Native Shortcut templates and their generator are available in [`tools/ios-shortcuts`](../../tools/ios-shortcuts/readme.md). They select only enabled normal Clock alarms containing the case-sensitive label substring `WLED`, include a read-only device acceptance check, and default to preview mode until their Clock-field behavior is verified on the actual iPhone. They do not read Health's sleep schedule or install personal automations.
 
 | Endpoint | Purpose |
 |---|---|
@@ -195,11 +251,24 @@ The status distinguishes `disabled`, `empty`, `scheduled`, `waiting_for_time`, `
 
 ### Persistence and security
 
-The profile, last capture, wake instant and monotonic consumed-wake watermark are stored together in one bounded version-2 JSON blob in ESP32 NVS namespace `weckersync`, key `state`. This uses NVS's replacement/recovery semantics, without modifying partition layouts or other namespaces. There are no access credentials in the record. Former version-1 records are rewritten without their obsolete credential fields while preserving profile and replay protection. Ordinary firmware-only OTA retains NVS.
+The profile, last capture, wake instant and monotonic consumed-wake watermark are stored together in one bounded JSON blob in ESP32 NVS namespace `weckersync`, key `state`. Single mode retains version 2; list mode uses version 3 and additionally stores the normalized list and its local execution dates. This uses NVS's replacement/recovery semantics, without modifying partition layouts or other namespaces. There are no access credentials in the record. Former version-1 records are rewritten without their obsolete credential fields while preserving profile and replay protection. Ordinary firmware-only OTA retains NVS.
 
 The watermark is committed **before** taking LED ownership. A reboot never replays a consumed occurrence, including an overlapping, unreachable or manually skipped one. Completed/started outcome writes are diagnostic; if such a write fails, the required consumption marker still prevents replay. New dates at or before the consumed UTC watermark are rejected unless merely acknowledging the same consumed slot. Storage corruption disables this integration, not the manual alarms.
 
 NVS is not included in the JSON/filesystem configuration backup. Filesystem-only resets do not erase this namespace; clear/disable the managed slot before transferring the controller. Use this credential-free API **only in an isolated, trusted home network**. Do not publish it through port forwarding or a local reverse proxy: the subnet check cannot identify an external caller hidden behind such a proxy. HTTP is not encrypted. ESP8266 retains the normal manual alarm feature, reports `supported:false` here, and rejects sync writes with `501 sync_unsupported`.
+
+## Known limitations
+
+This is development firmware. Successful storage, native tests and compilation are not a guarantee that every scheduling or hardware transition behaves correctly.
+
+- **Earlier edits during a running iPhone light curve:** moving a wake earlier can end the old curve while the new occurrence is excluded by the global consumed-wake watermark. A confirmed sync means the data was stored, not that this changed occurrence will run.
+- **Future skips and equal local times:** list execution dates are currently carried by wake minute. A skip on a future date can suppress an earlier newly added occurrence at the same time. Skips need more precise occurrence identity for that case.
+- **Existing Sunrise nightlight:** the ordinary WLED Sunrise nightlight's throttled cleanup can arrive after this usermod takes control and be treated as manual override. Avoid combining those two automatic sunrise runners until their handoff is corrected.
+- **Expired manual one-shots:** multiple enabled expired one-shot alarms can block individual configuration edits because each save revalidates the entire list. They may need to be deactivated/removed together in one validated configuration update.
+- **Profile activation:** the iPhone list's enabled badges describe Clock state, not full light-runner readiness. The independent profile still needs one-time activation through its API; the list view is read-only.
+- **Legacy tooling:** the bundled generator still emits single-wake workflows. A legacy Sync/Clear write replaces a stored list; use the [list-sync guide](iphone-shortcut.md) and do not run both client types.
+
+These limitations are documented rather than silently changing consumption/storage behavior. Reliability changes should pair their regression cases with anti-replay, restart and unaffected-alarm tests.
 
 ## Architecture and validation
 
@@ -207,6 +276,7 @@ NVS is not included in the JSON/filesystem configuration backup. Filesystem-only
 - `light_alarm_config.h`: shared ingress/filesystem validation and versioned serialization.
 - `light_alarm_store.h`: durable configuration replacement and legacy preservation.
 - `light_alarm_sync.h`, `light_alarm_sync_store.h`: explicit UTC phone sync, local-network access, independent profile and NVS replay/ordering persistence on ESP32.
+- `light_alarm_phone_list.h`: bounded Clock property decoding and canonical list serialization; `light_alarm_sync.h` schedules imported recurrences with the existing calendar model.
 - `light_alarm_presence.h`: asynchronous ping/TCP/ARP probes; callbacks publish atomics, never touch LEDs or files.
 - `light_alarm_udp.h`, `light_alarm_probe_codec.h`: bounded direct-unicast mDNS/ICMP/ARP evidence and a transparent packet observer. Networking state is initialized in lwIP context; receive buffers and PCBs are bounded/reused.
 - `light_alarm_atomic.h`, `light_alarm_lock.h`: ESP32 task synchronization and ESP8266 cooperative callback compatibility.

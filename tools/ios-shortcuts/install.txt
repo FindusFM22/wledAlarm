@@ -1,0 +1,40 @@
+WLED legacy single-wake iPhone alarm Shortcuts
+
+IMPORTANT: This package is not the current whole-list sync client. Its Sync and
+Clear templates replace an existing imported iPhone list with single-wake mode.
+For list sync, use usermods/wecker_presence/iphone-shortcut.md in this repository.
+Do not run legacy and list-sync automations together. Setup and Status are safe
+for one-time profile activation and read-only inspection without replacing a list.
+
+If there are no top-level .shortcut files yet:
+1. On a Mac signed into iCloud, double-click "Sign on Mac.command".
+2. Wait for "All five files are signed". Apple receives only these generic
+   templates for validation; there are no device addresses or alarm readings.
+3. AirDrop the five top-level .shortcut files to the iPhone. Do not send files
+   from unsigned/; those are inspectable source, not ready for iPhone import.
+
+On the iPhone:
+1. Open WLED Alarm Check in Shortcuts. Test an enabled WLED-labelled alarm,
+   an earlier disabled alarm, tomorrow and weekly repeats. Check never writes.
+2. Import Setup, Sync, Status and Clear. Each asks for WLED's fixed IPv4 URL.
+3. Run Setup once to enable the separate iPhone light profile. Open WLED's
+   /wecker.htm and check the master switch, light settings, NTP and presence.
+4. Sync initially uses preview mode. Set its first Number action to 1 ONLY
+   after Check selects the correct alarms on this actual iPhone.
+5. Run Sync and check Status. A receipt alone is not success: the Shortcut
+   waits for confirmed durable storage before reporting success.
+6. Add a Clock-app-closed and a daily evening trigger on the iPhone. Approve
+   Clock/local-network access and locked execution there. Those approvals
+   cannot be silently granted by a transferred file.
+
+Only enabled normal Clock alarms containing the exact uppercase text WLED
+qualify. The earliest actual future occurrence is sent. The Health sleep
+schedule and existing manual WLED alarms are not modified. An empty successful
+Clock read clears only the managed iPhone slot. Errors never intentionally
+send a clear. A fresh sync is required for the next occurrence/day.
+
+These workflows are not yet certified by a physical iOS 27.2 test. Keep
+preview mode if Clock properties or date selection do not work as expected.
+Always retain the iPhone's acoustic alarm as the primary wake-up device.
+
+Complete developer documentation: tools/ios-shortcuts/readme.md in the WLED fork.
