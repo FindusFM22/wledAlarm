@@ -100,13 +100,113 @@ Legacy array-format files are migrated after a valid clock is available. IDs, la
 | `POST /wecker/control` | `{"action":"stop"}`, `snooze`, `skip`, `presence-check`, or `{"action":"preview","id":"..."}`. |
 | `GET /wecker/result?job=...` | Result of a queued operation. |
 
-Writes and commands obey WLED's configured settings PIN policy. A POST returns **202 with a job ID**, not a premature success. Poll the result until it is no longer 202: 200 confirms completion, 409 indicates a revision/operation conflict, and invalid input or storage errors are rejected. Only after a confirmed save should a client replace its local configuration. The browser refreshes revisions and does not silently overwrite another browser's changes. Raw file-editor modifications are not hot-reloaded; use the API/UI.
+Manual configuration writes and `/wecker/control` commands retain WLED's configured settings PIN policy. A POST returns **202 with a job ID**, not a premature success. Poll the result until it is no longer 202: 200 confirms completion, 409 indicates a revision/operation conflict, and invalid input or storage errors are rejected. Only after a confirmed save should a client replace its local configuration. The browser refreshes revisions and does not silently overwrite another browser's changes. Raw file-editor modifications are not hot-reloaded; use the API/UI.
+
+## iPhone next-wake sync (ESP32)
+
+This is a separate **single, one-shot slot**, in addition to the 16 manual alarms. It accepts an explicit next wake instant, not an Apple alarm ID or the complete Clock alarm list. The server does not assume that a particular iOS version exposes enabled status, a next-occurrence date, or the Health sleep schedule. Verify those capabilities on the actual phone before relying on a Shortcut to choose the correct occurrence.
+
+The feature is **disabled after installation**. Existing manual alarms, their revision, phone target, presets and LED configuration are unchanged. Manual alarms remain active until you deliberately disable them. Both sources share the existing presence checks and one light runner; a manual alarm wins an exact start-time tie, and overlaps are consumed rather than replayed.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /wecker/sync/iphone` | Current slot status; also included as `iphone` in `/wecker/status`. |
+| `POST /wecker/sync/iphone` | Replace or explicitly clear the single iPhone wake instant. |
+| `GET /wecker/sync/iphone/result?job=...&boot=...` | Follow the receipt's `resultUrl` to read sync/profile job results. |
+| `GET /wecker/sync/iphone/profile` | Read the independent light profile and its revision. |
+| `POST /wecker/sync/iphone/profile` | Set the profile/enable flag, or copy one manual alarm's light settings once. |
+
+**All of these new endpoints intentionally require no token, login, PIN or authorization header.** They trust direct clients in the ESP's local IPv4 subnet. Off-subnet, unset, network and broadcast addresses are rejected. This is a network restriction, not authentication of a particular phone/person: any device on the trusted subnet can change the managed slot and its profile. Ordinary WLED and manual-alarm access policies are not changed. The former token endpoint no longer exists.
+
+Both POSTs return **202** with `job`, `confirmed: false` and `resultUrl`. Follow that URL until HTTP **200** and `confirmed: true`; only then is the operation durably committed. Result URLs include a public boot identifier; it is **not an access credential**. A missing/old identifier returns `410 job_from_other_boot`, rather than confirming a recycled job ID after reboot. Errors retain the previous confirmed state. Results expire from the bounded eight-job RAM ring and do not survive reboot; after an uncertain sync result, read the saved status or resend the exact payload. Do not generate a new `capturedAt` just to retry an old reading.
+
+### Payload and ordering
+
+```json
+{
+  "capturedAt": "2026-11-08T22:15:00.123+01:00",
+  "wakeAt": "2026-11-09T07:00:00+01:00"
+}
+```
+
+- Both fields are required; no other fields are accepted. Capture the timestamp when reading the phone's alarm data, **before** any network wait/retry.
+- Use RFC 3339 timestamps with `Z` or an explicit `±HH:MM` offset. Dates are limited to 2024–2099, real-world offsets to ±14 hours. Leap seconds, unknown `-00:00` offsets, timezone-free dates and more than three fractional digits are rejected. `capturedAt` supports milliseconds; `wakeAt` must have whole-second precision (an optional `.000` is accepted).
+- The explicit UTC instant is authoritative, even during the second repeated DST hour. The ESP's timezone affects display, not the received instant. The device computes light start from the independent profile's rise duration.
+- A valid device clock is required for a new update. A new capture may be at most 24 hours old or 5 minutes ahead of the device. A new wake instant must be in the future and at most 8 days away.
+- An older capture is rejected with `409 stale_sync`. The same capture with different data is `409 sync_conflict`. Equivalent timestamps with different offsets compare as the same instant.
+- An exact retry is acknowledged without another flash write, even after execution or expiry. A fresher capture of the same consumed occurrence advances ordering but **never re-arms it**.
+- Client writes are limited to one per second (`429 sync_rate_limited`, retry after one second). Execution markers are not rate-limited.
+
+Only an explicit successful no-alarm reading clears the slot:
+
+```json
+{"capturedAt":"2026-11-08T22:15:00+01:00","wakeAt":null}
+```
+
+Missing/invalid fields, malformed JSON (including trailing garbage and NUL escapes), a read error, or a network error must **not** be converted to this payload. A clear or replacement ends a running iPhone alarm, but never a running manual alarm. Clearing/disabling the managed slot retains its ordering and execution watermarks.
+
+### Profile setup
+
+Read `/wecker/sync/iphone/profile`, then POST the returned **profile revision**, not the manual configuration revision:
+
+```json
+{
+  "revision": 0,
+  "enabled": true,
+  "profile": {
+    "label": "iPhone",
+    "rampMin": 30,
+    "holdMin": 30,
+    "fadeMin": 5,
+    "snoozeMin": 10,
+    "brightness": 180,
+    "white": 220,
+    "scene": "sunrise",
+    "preset": 0
+  }
+}
+```
+
+Alternatively, `{"revision":0,"enabled":true,"copyFrom":"existing-manual-id"}` copies that alarm's light settings once. It does not import its ID, recurrence or execution dates and does not remove/disable the manual alarm. Profile edits affect the next start, not a running light curve; disabling the phone profile ends its current run. Use the current revision from GET; conflicts return `409 profile_revision_conflict`. A phone sync never changes the profile revision.
+
+### Terminal sync example
+
+These examples use `curl` and `jq`. Enable/configure the independent profile once, then send just the next wake instant from the phone. No authorization header or global configuration revision is needed for a sync.
+
+```sh
+WLED='http://192.168.178.32'
+CAPTURED=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+WAKE_AT='2026-11-09T07:00:00+01:00' # Choose your actual future wake instant.
+BODY=$(jq -cn --arg captured "$CAPTURED" --arg wake "$WAKE_AT" \
+  '{capturedAt:$captured,wakeAt:$wake}')
+RECEIPT=$(curl --noproxy '*' -fsS \
+  -H 'Content-Type: application/json' \
+  --data "$BODY" "$WLED/wecker/sync/iphone")
+RESULT_URL=$(printf '%s\n' "$RECEIPT" | jq -er '.resultUrl')
+
+# Repeat while HTTP 202; only 200 / confirmed:true confirms a durable save.
+curl --noproxy '*' -fsS \
+  "$WLED$RESULT_URL" | jq
+
+curl --noproxy '*' -fsS "$WLED/wecker/sync/iphone" | jq
+```
+
+The status distinguishes `disabled`, `empty`, `scheduled`, `waiting_for_time`, `started`, `completed`, `skipped`, `stopped`, `cancelled`, `interrupted`, `consumed`, `expired` and storage unavailability. `occurrenceState` retains the saved state even when the integration/master is disabled. ISO timestamps are UTC; the additional `*Local` numeric values are only for WLED's UI. There is no automatic repeat tomorrow without another sync.
+
+### Persistence and security
+
+The profile, last capture, wake instant and monotonic consumed-wake watermark are stored together in one bounded version-2 JSON blob in ESP32 NVS namespace `weckersync`, key `state`. This uses NVS's replacement/recovery semantics, without modifying partition layouts or other namespaces. There are no access credentials in the record. Former version-1 records are rewritten without their obsolete credential fields while preserving profile and replay protection. Ordinary firmware-only OTA retains NVS.
+
+The watermark is committed **before** taking LED ownership. A reboot never replays a consumed occurrence, including an overlapping, unreachable or manually skipped one. Completed/started outcome writes are diagnostic; if such a write fails, the required consumption marker still prevents replay. New dates at or before the consumed UTC watermark are rejected unless merely acknowledging the same consumed slot. Storage corruption disables this integration, not the manual alarms.
+
+NVS is not included in the JSON/filesystem configuration backup. Filesystem-only resets do not erase this namespace; clear/disable the managed slot before transferring the controller. Use this credential-free API **only in an isolated, trusted home network**. Do not publish it through port forwarding or a local reverse proxy: the subnet check cannot identify an external caller hidden behind such a proxy. HTTP is not encrypted. ESP8266 retains the normal manual alarm feature, reports `supported:false` here, and rejects sync writes with `501 sync_unsupported`.
 
 ## Architecture and validation
 
 - `light_alarm_model.h`: bounded Gregorian scheduling, DST resolution, monotonic runner and presence confidence.
 - `light_alarm_config.h`: shared ingress/filesystem validation and versioned serialization.
 - `light_alarm_store.h`: durable configuration replacement and legacy preservation.
+- `light_alarm_sync.h`, `light_alarm_sync_store.h`: explicit UTC phone sync, local-network access, independent profile and NVS replay/ordering persistence on ESP32.
 - `light_alarm_presence.h`: asynchronous ping/TCP/ARP probes; callbacks publish atomics, never touch LEDs or files.
 - `light_alarm_udp.h`, `light_alarm_probe_codec.h`: bounded direct-unicast mDNS/ICMP/ARP evidence and a transparent packet observer. Networking state is initialized in lwIP context; receive buffers and PCBs are bounded/reused.
 - `light_alarm_atomic.h`, `light_alarm_lock.h`: ESP32 task synchronization and ESP8266 cooperative callback compatibility.
@@ -129,6 +229,8 @@ Before relying on the alarm, check on the physical device: overnight locked phon
 ### References and attribution
 
 - Calendar conventions: [RFC 3339 §5.7](https://www.rfc-editor.org/rfc/rfc3339#section-5.7).
+- Sync timestamp format: [RFC 3339 §5.6](https://www.rfc-editor.org/rfc/rfc3339#section-5.6).
+- Sync storage/recovery: [Espressif NVS](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32/api-reference/storage/nvs_flash.html); public boot identifiers: [Espressif hardware RNG](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32/api-reference/system/random.html).
 - Brightness curve: [cubic smoothstep](https://en.wikipedia.org/wiki/Smoothstep).
 - ICMP sessions: [Espressif ICMP Echo API](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/protocols/icmp_echo.html).
 - ESP8266 SDK callback contract: [ESP8266Ping](https://github.com/dancol90/ESP8266Ping/blob/master/src/ESP8266Ping.cpp); its blocking wait is not used.
