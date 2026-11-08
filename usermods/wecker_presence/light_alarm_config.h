@@ -56,22 +56,12 @@ inline bool number(JsonVariantConst value, uint32_t minimum, uint32_t maximum, u
   return output >= minimum && output <= maximum;
 }
 
-// The same parser serves HTTP ingress and defensive filesystem loading.
-inline bool parseAlarm(JsonObjectConst object, Alarm& alarm, bool legacy, const char*& error) {
+// Share light-profile validation between manual alarms and the independent phone slot.
+inline bool parseLightProfile(JsonObjectConst object, Alarm& alarm, bool legacy, const char*& error) {
   uint32_t value;
-  const char* id = object["id"];
   const char* label = object["label"] | "";
-  if (!validId(id) || !validLabel(label)) { error = "invalid_id_or_label"; return false; }
-  strcpy(alarm.id, id); // Lengths were checked against the destination capacities above.
+  if (!validLabel(label)) { error = "invalid_id_or_label"; return false; }
   strcpy(alarm.label, label);
-  if (!object["enabled"].is<bool>()) { error = "invalid_enabled"; return false; }
-  alarm.enabled = object["enabled"];
-  if (!number(object["wakeH"], 0, 23, value)) { error = "invalid_time"; return false; }
-  alarm.wakeMinute = value * 60;
-  if (!number(object["wakeM"], 0, 59, value)) { error = "invalid_time"; return false; }
-  alarm.wakeMinute += value;
-  if (!number(object["dow"], 0, 127, value)) { error = "invalid_weekdays"; return false; }
-  alarm.weekdays = value;
   if (!number(object[legacy ? "offsetMin" : "rampMin"], 0, 120, value)) { error = "invalid_ramp"; return false; }
   alarm.rampMinutes = value;
   if (!number(object["preset"], 0, 250, value)) { error = "invalid_preset"; return false; }
@@ -95,6 +85,25 @@ inline bool parseAlarm(JsonObjectConst object, Alarm& alarm, bool legacy, const 
   alarm.brightness = value;
   if (!number(object["white"], 0, 255, value)) { error = "invalid_white"; return false; }
   alarm.white = value;
+  return true;
+}
+
+// The same parser serves HTTP ingress and defensive filesystem loading.
+inline bool parseAlarm(JsonObjectConst object, Alarm& alarm, bool legacy, const char*& error) {
+  const char* id = object["id"];
+  if (!validId(id)) { error = "invalid_id_or_label"; return false; }
+  strcpy(alarm.id, id); // Length was checked against the destination capacity above.
+  if (!object["enabled"].is<bool>()) { error = "invalid_enabled"; return false; }
+  alarm.enabled = object["enabled"];
+  uint32_t value;
+  if (!number(object["wakeH"], 0, 23, value)) { error = "invalid_time"; return false; }
+  alarm.wakeMinute = value * 60;
+  if (!number(object["wakeM"], 0, 59, value)) { error = "invalid_time"; return false; }
+  alarm.wakeMinute += value;
+  if (!number(object["dow"], 0, 127, value)) { error = "invalid_weekdays"; return false; }
+  alarm.weekdays = value;
+  if (!parseLightProfile(object, alarm, legacy, error)) return false;
+  if (legacy) return true;
   if (!number(object["date"], 0, 20991231, alarm.date) || (alarm.date && !validDate(alarm.date)) || (!alarm.weekdays && !alarm.date)) {
     error = "invalid_date"; return false;
   }
@@ -134,6 +143,19 @@ inline bool parseConfig(JsonVariantConst root, Config& output, bool legacy, cons
   return true;
 }
 
+// Only visual/timing fields are copied; a phone sync cannot change manual dates or IDs.
+inline void serializeLightProfile(JsonObject object, const Alarm& alarm) {
+  object["label"] = alarm.label;
+  object["rampMin"] = alarm.rampMinutes;
+  object["holdMin"] = alarm.holdMinutes;
+  object["fadeMin"] = alarm.fadeMinutes;
+  object["snoozeMin"] = alarm.snoozeMinutes;
+  object["brightness"] = alarm.brightness;
+  object["white"] = alarm.white;
+  object["scene"] = alarm.scene == Scene::Sunrise ? "sunrise" : "preset";
+  object["preset"] = alarm.preset;
+}
+
 inline void serializeConfig(JsonObject root, const Config& config) {
   root["version"] = SCHEMA_VERSION;
   root["revision"] = config.revision;
@@ -144,20 +166,12 @@ inline void serializeConfig(JsonObject root, const Config& config) {
     const Alarm& alarm = config.alarms[i];
     JsonObject object = alarms.createNestedObject();
     object["id"] = alarm.id;
-    object["label"] = alarm.label;
+    serializeLightProfile(object, alarm);
     object["enabled"] = alarm.enabled;
     object["wakeH"] = alarm.wakeMinute / 60;
     object["wakeM"] = alarm.wakeMinute % 60;
     object["dow"] = alarm.weekdays;
     object["date"] = alarm.date;
-    object["rampMin"] = alarm.rampMinutes;
-    object["holdMin"] = alarm.holdMinutes;
-    object["fadeMin"] = alarm.fadeMinutes;
-    object["snoozeMin"] = alarm.snoozeMinutes;
-    object["brightness"] = alarm.brightness;
-    object["white"] = alarm.white;
-    object["scene"] = alarm.scene == Scene::Sunrise ? "sunrise" : "preset";
-    object["preset"] = alarm.preset;
     object["lastDate"] = alarm.lastDate;
     object["skipDate"] = alarm.skipDate;
   }
