@@ -19,27 +19,31 @@ This is a fork of [WLED](https://github.com/wled/WLED) with an integrated iOS-st
 
 A light alarm clock built into the WLED firmware itself:
 
-- **Set alarms** with wake time, lead time (0–90 min before wake), weekday repeat, label, and preset
-- **Two timers per alarm:** lights on at `wakeTime - leadTime` via your chosen preset, lights off automatically 1 hour after lights-on
-- **Shared across all devices:** alarm data is stored on the WLED device at `/wecker.json` — iPhone, Mac, tablet all see the same list
+- **Real RGBW wake-up sequence:** rise to the target brightness at the selected wake time, hold, then fade out
+- **Recurring or dated one-shot alarms:** labels, per-alarm durations, snooze, stop, skip-next and a 30-second preview
+- **Phone presence without router login:** UDP/mDNS and fresh ARP replies first, with ping/TCP fallbacks, adaptive 15/5/10-minute checks and a clearly shown 60-minute confirmation grace
+- **Shared across devices:** versioned alarm data lives on the ESP at `/wecker.json`, with confirmed saves and protection against stale browser updates
 - **No app store, no cloud:** the UI is served directly from the ESP firmware
-- **Reboot-stable:** timers survive power loss (stored in `cfg.json` on LittleFS), time is synced via NTP on reconnect
-- **Preset 250** is auto-created as a "lights off" preset on first use
+- **Independent scheduling:** regular WLED timers stay untouched; persisted execution dates prevent duplicate alarms after reboot
+
+See [the light alarm documentation](usermods/wecker_presence/readme.md) for setup, presence limitations, migration and restart behaviour. Phone reachability is not proof of a person's location; test with a locked phone overnight before relying on it.
 
 ### How to use
 
-1. Flash this firmware to your ESP8266/ESP32 (see [Build](#build) below)
+1. Build firmware **including `wecker_presence`** (the `light_alarm_esp32` override example targets ESP32-WROOM-32(S)), then flash your ESP
 2. Open `http://<wled-ip>/wecker.htm` in your browser
-3. Tap **+**, set your wake time and a preset, save
-4. Add to home screen on iPhone for a native-app feel
+3. Set WLED's timezone/NTP, reserve your phone's IPv4, and enter it in **Phone presence setup**
+4. Tap **+**, set your wake time and light profile, then save and test the preview
+5. Add to home screen on iPhone for a native-app feel
 
 ### Architecture
 
 | What | Where |
 |---|---|
 | Wecker button in main nav | `wled00/data/index.htm` |
-| HTTP routes (`/wecker.htm`, `/wecker.json`) | `wled00/wled_server.cpp` |
-| Alarm UI source | `wled00/data/wecker.htm` |
+| Static page/assets | `wled00/wled_server.cpp` |
+| Alarm API, schedule, storage, presence and light runner | `usermods/wecker_presence/` |
+| Alarm UI source | `wled00/data/wecker.htm`, `wecker.js`, `wecker.css` |
 | Compiled UI header (generated, gitignored) | `wled00/html_wecker.h` |
 
 To rebuild the UI header after editing `wecker.htm`, run `npm run build` before compiling.
