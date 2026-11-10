@@ -377,7 +377,7 @@ def build_clear():
     shortcut.comment("Explicit manual clear of the managed iPhone slot. Never attach this shortcut to network-error handling. It does not delete or toggle Clock alarms or manual WLED alarms.")
     base = shortcut.base_url()
     shortcut.add("alert", WFAlertActionTitle="Clear WLED iPhone slot?", WFAlertActionCancelButtonShown=True,
-                 WFAlertActionMessage="Clear only the managed iPhone wake instant? A running iPhone light alarm will stop. Clock alarms and manual WLED alarms are unchanged.")
+                 WFAlertActionMessage="Clear only the pending iPhone schedule? An already running light alarm will continue. Use WLED Stop to turn it off early. Clock alarms and manual WLED alarms are unchanged.")
     _, captured = shortcut.capture()
     body = shortcut.add("gettext", WFTextActionText=text('{"capturedAt":"', captured, '","wakeAt":null}'))
     shortcut.send_confirmed(base, SYNC_PATH, body, "Managed WLED iPhone slot cleared; Clock and manual WLED alarms unchanged.")

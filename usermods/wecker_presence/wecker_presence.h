@@ -54,7 +54,6 @@ class WeckerPresenceUsermod : public Usermod {
   LightAlarm::WledAdapter _lights;
   LightAlarm::Frame _frame;
   LightAlarm::Occurrence _runningOccurrence;
-  LightAlarm::PhoneAlarm _runningPhoneAlarm;
   LightAlarm::PresencePolicy _presencePolicy;
   uint32_t _presenceWaitWake = 0;
   char _presenceWaitId[33] = "";
@@ -99,7 +98,7 @@ class WeckerPresenceUsermod : public Usermod {
   void processJob();
   void finishJob(const Job&, uint16_t, const char*);
   bool commitCandidate(const char*&);
-  bool commitPhoneCandidate(const char*&, const char* reason = "iphone_sync_changed");
+  bool commitPhoneCandidate(const char*&);
   void loadPhoneConfiguration();
   uint16_t processPhoneJob(const Job&, JsonVariantConst, const char*&);
   void setPhoneOutcome(LightAlarm::SyncPhase, uint32_t);

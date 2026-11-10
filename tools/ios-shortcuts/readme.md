@@ -31,7 +31,7 @@ The generator also packages explicit outputs into a ZIP: **`WLED Shortcuts - Mac
 | **WLED Alarm Setup** | Enable the independent profile, retaining its light settings and using its current revision. |
 | **WLED Alarm Sync** | Send the next enabled normal Clock alarm whose label contains the exact, case-sensitive substring `WLED`; an explicitly successful empty reading clears only the iPhone slot. **Preview mode by default.** |
 | **WLED Alarm Status** | Read the stored slot and readiness/status flags. |
-| **WLED Alarm Clear** | Explicit, confirmed manual clear. Stops a running managed iPhone light alarm, not a manual alarm. |
+| **WLED Alarm Clear** | Explicit, confirmed clear of the pending iPhone schedule. An already running light curve continues; Clock and manual WLED alarms are unchanged. |
 
 ## Device acceptance: iOS 27.2
 
@@ -59,7 +59,7 @@ Add triggers to **WLED Alarm Sync** on the phone, after live mode and permission
 - **Wi-Fi → home network joined** or **Charger → connected**: optional catch-up after returning home or plugging in overnight.
 - An **Alarm → Is Stopped** trigger can sync the next occurrence after a normal wake-up, but is **not** an alarm-edited/enabled trigger and is too late to start today's sunrise.
 
-**Running-light consequence:** the existing API cancels a running managed iPhone light alarm when a sync replaces or clears its wake instant. A post-wake sync can therefore shorten its hold/fade period. Omit the optional Alarm-stopped trigger if that light curve should finish uninterrupted; this does not affect a running manual WLED alarm.
+**Running-light consequence:** sync replaces or clears only the pending iPhone schedule. A started light curve keeps its original rise, hold and fade-out, including after disabling/deleting the acoustic alarm or using the optional Alarm-stopped trigger. **Clear is not a light-off command.** To end the light early, use WLED **Stop** or manual light control. The master switch, explicit iPhone profile disable, presence expiry and the maximum runtime still apply. Manual WLED alarms remain independent. Regenerate/reimport the Clear template to replace older wording that promised to stop the light; older firmware still has that previous stop-on-sync behavior.
 
 Choose automatic/immediate execution where the phone offers it, allow running when locked, and grant local-network/Clock access during a manual run first. Triggers/permissions are configured on the actual phone; this generator does not install personal automations or change iPhone settings. See [Apple's iOS 27 automation guide](https://support.apple.com/guide/shortcuts/apdfbdbd7123/ios). Menu labels may differ by localization/build.
 

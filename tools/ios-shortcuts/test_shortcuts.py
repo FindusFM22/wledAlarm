@@ -417,6 +417,11 @@ class ShortcutsTests(unittest.TestCase):
         self.assertEqual(runtime.posts, [(BASE + generate.PROFILE_PATH, {"revision": 11, "enabled": True, "profile": PROFILE})])
 
     def test_explicit_clear_and_cancel(self):
+        document = generate.build_clear().document()
+        alert = next(action["WFWorkflowActionParameters"] for action in document["WFWorkflowActions"]
+                     if action["WFWorkflowActionIdentifier"] == "is.workflow.actions.alert")
+        self.assertIn("already running light alarm will continue", alert["WFAlertActionMessage"])
+        self.assertIn("WLED Stop", alert["WFAlertActionMessage"])
         runtime = Runtime(configured(generate.build_clear())).run()
         self.assertIsNone(runtime.posts[0][1]["wakeAt"])
         runtime = Runtime(configured(generate.build_clear()))

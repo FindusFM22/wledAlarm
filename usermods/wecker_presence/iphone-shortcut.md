@@ -101,6 +101,7 @@ After an uncertain result, inspect WLED status. Do not retry an old bare-list PO
 3. Check `/wecker/sync/iphone`: `mode:"list"`, the expected count and next wake, `enabled:true`, `masterEnabled:true`, `clockValid:true`, and no storage error.
 4. Test one enabled and one disabled alarm, an ordinary unlabelled alarm, repeat weekdays and a non-repeating alarm. WLED uses its own timezone; match it to the phone for home use.
 5. Test a short real alarm and locked-phone execution before overnight use. Keep the acoustic iPhone alarm enabled.
+6. During a real light alarm, disable its acoustic alarm in Clock and run the sync (or close Clock with the automation below). The imported row should become disabled, but the current light keeps its original rise, hold and fade-out. Also test deleting the alarm or uploading an explicitly empty list. Use WLED **Stop** to end the light early; syncing Clock is not a light-off command.
 
 If **Is Enabled** or **Repeat** is unavailable, stop and inspect the actual exposed properties. Do not assume every returned alarm is enabled. An explicit successful empty list clears the managed iPhone list; a Clock access/parse failure must not do so.
 
@@ -113,6 +114,8 @@ Create a personal automation:
 Older builds may use **Ask Before Running** instead. Permissions and personal automations must be configured on the actual phone.
 
 Stored weekly alarms advance automatically on WLED. You only need another upload when Clock data changes; an optional home-Wi-Fi/charger trigger can catch up. Siri or another app changing alarms does not necessarily close Clock, so sync explicitly after those edits.
+
+If the light has already woken you, you can disable the acoustic alarm before it rings and leave Clock. The automation updates future scheduling without cutting off the light you use to get up and dressed. The same rule applies after stopping the ringing alarm: if you configure a separate **Alarm → Is Stopped** sync trigger, its upload does not shorten the running light curve. Explicit WLED Stop/manual light control, the alarm master switch, profile disable, presence expiry and the maximum runtime still take precedence.
 
 > [!WARNING]
 > Disable automations using the legacy **WLED Alarm Sync** or **Clear** templates. Their successful single-wake writes replace list mode. The read-only Status and one-time Setup helpers do not replace the list.

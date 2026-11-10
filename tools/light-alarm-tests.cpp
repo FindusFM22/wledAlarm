@@ -825,14 +825,12 @@ void phoneListScheduling() {
   Config manual = example();
   manual.alarms[0].wakeMinute = 420;
   assert(nextCombinedOccurrence(manual, current, now, UTC).index == 0); // Existing manual tie policy.
-  const PhoneAlarm running = current.alarms[next.phoneIndex];
   assert(stagePhoneConsumption(current, next, candidate));
   current = candidate;
   assert(!stagePhoneConsumption(current, next, candidate));
   assert(phoneSyncOccurrence(current, next.start, UTC).date == 20261116); // No daily iPhone upload required.
-  assert(phoneListRetainsOccurrence(current, running, next.date));
   current.alarms[next.phoneIndex].enabled = false;
-  assert(!phoneListRetainsOccurrence(current, running, next.date));
+  assert(!phoneSyncOccurrence(current, next.start, UTC));
 
   current.reset();
   phoneListPayload(document, now, "Never");
@@ -900,6 +898,135 @@ void phoneListScheduling() {
   document.remove("capturedAt");
   assert(stagePhoneAlarmList(document.as<JsonVariantConst>(), current, now + 60, true, UTC, candidate).changed);
   assert(phoneSyncOccurrence(candidate, now + 60, UTC).wake == dateEpoch(20261108) + 22 * 3600);
+}
+
+// Clock sync owns future scheduling, not the started curve. Exercise real staging
+// and the commit's stop policy during rise, hold, fade and snooze in both API modes.
+void phoneRunUpdates() {
+  const uint32_t captured = dateEpoch(20261108) + 21 * 3600;
+  const uint32_t wake = dateEpoch(20261109) + 7 * 3600;
+  const uint32_t startedMs = 1000;
+  for (bool listMode : {false, true}) {
+    for (Phase phase : {Phase::Rising, Phase::Holding, Phase::Fading, Phase::Snoozed}) {
+      for (const std::string edit : {"disable", "remove", "time", "repeat", "rename", "legacy-clear", "legacy-replace", "profile"}) {
+        PhoneSyncRecord current, candidate, restored;
+        current.enabled = true;
+        DynamicJsonDocument document(8192);
+        if (listMode) {
+          phoneListPayload(document, captured, "Daily");
+          assert(stagePhoneAlarmList(document.as<JsonVariantConst>(), current, captured, true, UTC, candidate).changed);
+        } else {
+          PhoneSyncMessage message;
+          message.capturedAt = SyncTimestamp(captured); message.wakeAt = SyncTimestamp(wake);
+          assert(stagePhoneSync(current, message, captured, true, candidate).changed);
+        }
+        current = candidate;
+        const Occurrence running = phoneSyncOccurrence(current, captured, UTC);
+        assert(running.wake == wake);
+        assert(stagePhoneConsumption(current, running, candidate, SyncPhase::Started));
+        current = candidate;
+        const uint32_t elapsed = phase == Phase::Holding ? 1800000U : phase == Phase::Fading ? 3600000U : 60000U;
+        const uint32_t now = running.start + elapsed / 1000;
+        Runner runner, unchanged;
+        runner.start(current.profile, startedMs, elapsed);
+        unchanged.start(current.profile, startedMs, elapsed);
+        if (phase == Phase::Snoozed) {
+          assert(runner.snooze(startedMs) && unchanged.snooze(startedMs));
+        }
+        assert(runner.frame(startedMs).phase == phase);
+        const uint8_t brightness = runner.alarm().brightness;
+        const uint16_t ramp = runner.alarm().rampMinutes;
+        const std::string label = runner.alarm().label;
+
+        if (edit == "profile") {
+          JsonObject root = document.to<JsonObject>();
+          root["revision"] = current.profileRevision; root["enabled"] = true;
+          serializeLightProfile(root.createNestedObject("profile"), current.profile);
+          root["profile"]["brightness"] = 90; root["profile"]["rampMin"] = 0;
+          assert(stagePhoneProfile(root, example(), current, candidate).changed);
+        } else if (edit == "legacy-clear" || edit == "legacy-replace") {
+          PhoneSyncMessage message;
+          message.capturedAt = SyncTimestamp(now);
+          if (edit == "legacy-replace") message.wakeAt = SyncTimestamp(wake + SECONDS_PER_DAY);
+          assert(stagePhoneSync(current, message, now, true, candidate).changed);
+        } else {
+          phoneListPayload(document, now, edit == "repeat" ? "Tuesday" : "Daily", edit == "time" ? "08:00" : "07:00");
+          if (edit == "disable") document["alarms"][0]["enabled"] = false;
+          if (edit == "remove") document.createNestedArray("alarms");
+          if (edit == "rename") document["alarms"][0]["label"] = "Renamed";
+          assert(stagePhoneAlarmList(document.as<JsonVariantConst>(), current, now, true, UTC, candidate).changed);
+        }
+        // Mirror the post-save stop decision used by commitPhoneCandidate.
+        if (phoneUpdateStopsRun(candidate, runner, running)) runner.stop();
+        current = candidate;
+        assert(runner.active());
+        assert(runner.alarm().brightness == brightness && runner.alarm().rampMinutes == ramp && runner.alarm().label == label);
+        assert(current.consumedThrough == wake);
+        const Occurrence next = phoneSyncOccurrence(current, now, UTC);
+        if (edit == "disable" || edit == "remove" || edit == "legacy-clear") assert(!next);
+        else assert(!next || next.wake > wake);
+
+        // A restart keeps the changed schedule, but cannot replay today's run.
+        const char* error = "";
+        serializePhoneSyncRecord(document.to<JsonObject>(), current);
+        assert(parsePhoneSyncRecord(document.as<JsonObjectConst>(), restored, error));
+        assert(restored.consumedThrough == wake);
+        const Occurrence restoredDue = phoneSyncOccurrence(restored, now, UTC, true);
+        assert(!restoredDue || restoredDue.wake > wake);
+        if (restoredDue) {
+          // A changed later time may already be due, but the running curve wins;
+          // consuming that overlap must not stop or restart the original runner.
+          assert(stagePhoneConsumption(restored, restoredDue, candidate, SyncPhase::Skipped));
+          assert(!phoneUpdateStopsRun(candidate, runner, running));
+          restored = candidate;
+          assert(!phoneSyncOccurrence(restored, now, UTC, true));
+        }
+        // Even re-enabling/re-adding the original Clock time cannot re-arm it.
+        phoneListPayload(document, now + 1, "Daily");
+        assert(stagePhoneAlarmList(document.as<JsonVariantConst>(), restored, now + 1, true, UTC, candidate).changed);
+        assert(phoneSyncOccurrence(candidate, now + 1, UTC).wake > wake);
+
+        // No sync restarts the timer or truncates hold/fade; compare to an untouched
+        // runner through the original end, including the snooze's one-minute rise.
+        for (uint32_t step = 0; step <= 120U * 60000U; step += 1000) {
+          const Frame actual = runner.frame(startedMs + step), expected = unchanged.frame(startedMs + step);
+          assert(actual.phase == expected.phase && actual.brightness == expected.brightness &&
+            actual.blend == expected.blend && actual.progress == expected.progress);
+          assert(runner.active() == unchanged.active());
+        }
+        assert(!runner.active());
+      }
+    }
+  }
+}
+
+// Profile disable is still an explicit light-off control, scoped to automatic
+// iPhone runs. Shared manual alarms, previews and idle runners remain untouched.
+void phoneRunDisable() {
+  PhoneSyncRecord current, candidate;
+  current.enabled = true;
+  current.capturedAt = SyncTimestamp(dateEpoch(20261108));
+  current.wakeAt = SyncTimestamp(dateEpoch(20261109) + 7 * 3600);
+  current.consumedThrough = current.wakeAt.seconds;
+  current.phase = SyncPhase::Started;
+  StaticJsonDocument<2048> document;
+  document["revision"] = current.profileRevision; document["enabled"] = false;
+  serializeLightProfile(document.createNestedObject("profile"), current.profile);
+  assert(stagePhoneProfile(document.as<JsonObjectConst>(), example(), current, candidate).changed);
+  assert(candidate.consumedThrough == current.consumedThrough && candidate.wakeAt == current.wakeAt);
+  Occurrence running;
+  running.index = PHONE_ALARM_INDEX; running.wake = current.wakeAt.seconds;
+  Runner runner;
+  assert(!phoneUpdateStopsRun(candidate, runner, running));
+  runner.start(current.profile, 1000);
+  assert(phoneUpdateStopsRun(candidate, runner, running));
+  runner.stop();
+  assert(!runner.active() && !phoneSyncOccurrence(candidate, current.wakeAt.seconds, UTC));
+  runner.start(current.profile, 1000, 0, true);
+  assert(!phoneUpdateStopsRun(candidate, runner, running));
+  runner.start(current.profile, 1000);
+  running.index = 0;
+  assert(!phoneUpdateStopsRun(candidate, runner, running));
 }
 
 // Round-trip the full bounded list and reject corrupted device-owned schedule markers.
@@ -974,6 +1101,8 @@ int main(int argc, char** argv) {
   else if (test == "phone-list-ingress") phoneListIngress();
   else if (test == "phone-list-ordering") phoneListOrdering();
   else if (test == "phone-list-scheduling") phoneListScheduling();
+  else if (test == "phone-run-updates") phoneRunUpdates();
+  else if (test == "phone-run-disable") phoneRunDisable();
   else if (test == "phone-list-storage") phoneListStorage();
   else return 1;
   std::cout << test << " passed\n";

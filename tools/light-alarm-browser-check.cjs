@@ -25,6 +25,7 @@ const assets = {
 };
 let config = { version: 2, revision: 0, enabled: true, presenceHost: '', alarms: [], migrationPending: false };
 let run = { active: false, preview: false, phase: 'idle', progress: 0 };
+let events = [];
 let presence = 'unknown', nextError = '', backendAvailable = true, nextJob = 1;
 let confirmationAge = 1, grace = false;
 let phone = null;
@@ -43,7 +44,7 @@ function status() {
 			ping: presence === 'present' && !grace, tcp: false, mdns: false, icmp: false, arp: 'no_reply', error: grace ? 'no_response' : '',
 			monitoring: alarm && config.enabled ? 'scheduled' : 'paused', intervalSeconds: alarm && config.enabled ? 900 : 0, nextCheckSeconds: alarm && config.enabled ? 300 : null,
 			historyStored: 96, historyCapacity: 96, historyGeneration: 96, history: history.slice(0, 12) },
-		run, events: [], ...(phone ? { iphone: phone } : {}), ...(alarm && config.enabled ? { next: { id: alarm.id, label: alarm.label, date: 20261109, wakeLocal: deviceLocal + 13 * 3600, startLocal: deviceLocal + 12.5 * 3600, endLocal: deviceLocal + 13.5 * 3600 } } : phoneNext ? { next: phoneNext } : {}) };
+		run, events, ...(phone ? { iphone: phone } : {}), ...(alarm && config.enabled ? { next: { id: alarm.id, label: alarm.label, date: 20261109, wakeLocal: deviceLocal + 13 * 3600, startLocal: deviceLocal + 12.5 * 3600, endLocal: deviceLocal + 13.5 * 3600 } } : phoneNext ? { next: phoneNext } : {}) };
 }
 
 const server = http.createServer(async (request, response) => {
@@ -211,6 +212,19 @@ async function waitReady(page) {
 		phone.mode = 'list'; ++phone.revision; phone.capturedAt = '2026-11-08T17:03:00Z'; phoneAlarms = [];
 		await second.waitForFunction(() => document.getElementById('iphoneAlarmsMessage').textContent.includes('No iPhone alarms in the last synced Clock list'));
 		assert.equal(await second.locator('#iphoneAlarmList .iphone-alarm').count(), 0);
+		// A cleared schedule can coexist with the original running curve. The UI
+		// must keep the run controls usable instead of treating an empty list as Stop.
+		phone.status = 'started'; phone.occurrenceState = 'empty';
+		run = { active: true, preview: false, phase: 'holding', progress: 100, id: 'iphone', source: 'iphone', label: 'Original wake' };
+		await second.waitForFunction(() => document.getElementById('iphoneSyncState').textContent.includes('started · empty'));
+		await second.locator('#activeRun').waitFor({ state: 'visible' });
+		assert.match(await second.locator('#runTitle').textContent(), /Original wake/);
+		assert.match(await second.locator('#iphoneAlarms').textContent(), /light continues its rise, hold and fade-out/);
+		assert.equal(await second.locator('#stopRun').isDisabled(), false);
+		await second.locator('#stopRun').click();
+		await second.locator('#activeRun').waitFor({ state: 'hidden' });
+		events = [{ source: 'iphone', timeLocal: deviceLocal, reason: 'iphone_profile_disabled' }];
+		await second.waitForFunction(() => document.getElementById('events').textContent.includes('Stopped: iPhone light profile disabled'));
 		assert.equal(JSON.stringify(config), manualBeforeSync);
 		assert.equal([...jobs.values()].some(job => job.route.startsWith('/wecker/sync/')), false);
 		assert.deepEqual(errors, []);
@@ -231,7 +245,7 @@ async function waitReady(page) {
 		const missing = await context.newPage(); await missing.goto(url);
 		await missing.waitForFunction(() => document.getElementById('message').classList.contains('error'));
 		assert.equal(await missing.locator('#addAlarm').isDisabled(), true);
-		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, read-only iPhone list, snapshot caching/recovery, missing backend.');
+		console.log('Browser checks passed: compiled assets, mobile UI, reverse proxy, CRUD, presets, preview, confirmation grace, XSS, save failure, revision conflict, read-only iPhone list, snapshot caching/recovery, running light after schedule clear, explicit Stop, profile-disable activity, missing backend.');
 	} finally {
 		if (browser) await browser.close();
 		await new Promise(resolve => server.close(resolve));

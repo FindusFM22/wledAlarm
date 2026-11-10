@@ -401,25 +401,17 @@ void WeckerPresenceUsermod::loadPhoneConfiguration() {
   }
 }
 
-// Persist first, then apply the independently owned slot. A clear/profile disable
-// never interrupts a running manual alarm or changes its persistent configuration.
-bool WeckerPresenceUsermod::commitPhoneCandidate(const char*& error, const char* reason) {
+// Persist first, then apply the independently owned schedule. Clock edits/clears
+// leave the started light curve intact; only an explicit profile disable stops it.
+// Neither operation interrupts manual alarms or changes their persistent configuration.
+bool WeckerPresenceUsermod::commitPhoneCandidate(const char*& error) {
   _phoneLastSaveAttempt = millis();
   if (!_phoneStore.save(_phoneCandidate, error)) { _phoneStorageError = error; return false; }
-  bool cancel = false;
-  if (_runner.active() && !_runner.preview() && _runningOccurrence.index == PHONE_ALARM_INDEX) {
-    cancel = !_phoneCandidate.enabled;
-    if (_runningOccurrence.phoneIndex != UINT8_MAX) {
-      cancel |= !phoneListRetainsOccurrence(_phoneCandidate, _runningPhoneAlarm, _runningOccurrence.date);
-    } else {
-      cancel |= _phoneCandidate.listMode || _phoneCandidate.wakeAt.seconds != _runningOccurrence.wake ||
-        _phoneCandidate.phase == SyncPhase::Empty || _phoneCandidate.phase == SyncPhase::Cancelled;
-    }
-  }
+  const bool stopCurrent = phoneUpdateStopsRun(_phoneCandidate, _runner, _runningOccurrence);
   _phone = _phoneCandidate;
   _phonePublishedRevision = _phone.revision;
   _phoneStorageError = "";
-  if (cancel) stopRunner(reason);
+  if (stopCurrent) stopRunner("iphone_profile_disabled");
   _lastSchedule = UINT32_MAX;
   return true;
 }
@@ -443,7 +435,7 @@ uint16_t WeckerPresenceUsermod::processPhoneJob(const Job& job, JsonVariantConst
   error = decision.error;
   if (decision.code != 200 || !decision.changed) return decision.code;
   if (_phoneRequestWritten && millis() - _phoneLastRequestWrite < 1000) { error = "sync_rate_limited"; return 429; }
-  if (!commitPhoneCandidate(error, _phoneCandidate.wakeAt.seconds ? "iphone_sync_changed" : "iphone_sync_cleared")) return 500;
+  if (!commitPhoneCandidate(error)) return 500;
   _phoneLastRequestWrite = millis();
   _phoneRequestWritten = true;
   return 200;
@@ -669,7 +661,6 @@ void WeckerPresenceUsermod::schedule(uint32_t now) {
     if (!_lights.begin(alarm, false, _fallback, error)) { recordOccurrence(due, error, SyncPhase::Skipped); continue; }
     _runner.start(alarm, millis(), (now - due.start) * 1000U);
     _runningOccurrence = due;
-    if (due.phoneIndex < _phone.alarmCount) _runningPhoneAlarm = _phone.alarms[due.phoneIndex];
     _finishReason = "completed";
     recordOccurrence(due, _fallback ? "started_with_fallback" : "started", SyncPhase::Started);
   }

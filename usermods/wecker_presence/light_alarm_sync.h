@@ -261,16 +261,11 @@ inline Occurrence nextPhoneListOccurrence(const PhoneSyncRecord& record, uint32_
   return best;
 }
 
-// A running curve is retained when the new snapshot still enables its local
-// time/date, even after reordering/renaming or changing future repeat weekdays.
-inline bool phoneListRetainsOccurrence(const PhoneSyncRecord& record, const PhoneAlarm& running, uint32_t date) {
-  if (!record.listMode) return false;
-  for (uint8_t i = 0; i < record.alarmCount; ++i) {
-    const PhoneAlarm& alarm = record.alarms[i];
-    if (alarm.enabled && alarm.wakeMinute == running.wakeMinute &&
-        (alarm.weekdays ? (alarm.weekdays & (1U << mondayWeekday(date))) != 0 : alarm.date == date)) return true;
-  }
-  return false;
+// Clock edits/clears only update future scheduling; the runner owns its started
+// light curve. Explicitly disabling the iPhone light profile still ends that run,
+// without affecting manual alarms or previews that share the runner.
+inline bool phoneUpdateStopsRun(const PhoneSyncRecord& candidate, const Runner& runner, const Occurrence& running) {
+  return !candidate.enabled && runner.active() && !runner.preview() && running.index == PHONE_ALARM_INDEX;
 }
 
 // Parse the complete Clock snapshot into the member-owned candidate, not a large

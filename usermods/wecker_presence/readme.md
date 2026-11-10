@@ -30,8 +30,10 @@ There is no automatic flashing or router configuration. No router account is sto
 - **Stop** ends the alarm. A normal WLED brightness/colour/preset change also ends it, without the old alarm later overwriting that manual change.
 - **Snooze** is dark, followed by a one-minute rise and the normal hold/fade phases. Repeated snoozes have a hard maximum runtime.
 - Preview runs a 20-second rise, 5-second hold and 5-second fade, then restores the previous visual state. Manual control cancels restoration. Stop an existing WLED nightlight/playlist before previewing.
-- Removing or disabling a running alarm ends it. A scheduled alarm takes priority over a manual preview.
+- Removing or disabling a running **manual WLED alarm** ends it. iPhone Clock edits only change future scheduling: once started, the iPhone light alarm continues its original rise, hold and fade-out, including snooze, even if you disable/delete the acoustic alarm or sync an empty list. Use **Stop**, manual WLED light control, the alarm master switch or disabling the iPhone light profile to end it early. Presence expiry and the maximum runtime still apply. A scheduled alarm takes priority over a manual preview.
 - WLED's regular timer table is neither rewritten nor disabled.
+
+**Compatibility change:** earlier firmware stopped a running iPhone light alarm on a schedule clear, replacement or removal/disable of its Clock occurrence. These sync operations are now schedule-only, not light-off controls. Update any automation that relied on clearing the schedule to switch off the light; use explicit WLED **Stop** instead. No API payload or storage-schema migration is required.
 
 ## Phone checks and their limits
 
@@ -144,7 +146,7 @@ These are data mappings, not a guarantee that every iOS version exposes the same
 - Recurring alarms continue to their next weekdays **without another upload**. Only changes made in Clock require another upload; an App → Clock → Is Closed automation is a useful trigger. The Health/Sleep schedule is not imported.
 - WLED's existing DST policy applies: a missing spring-forward time moves forward by the one-hour gap; the repeated fall-back hour uses its first occurrence. Keep the iPhone's acoustic alarm as the primary wake-up device and physically test DST/locked-phone behavior.
 - Simultaneous iPhone alarms share one light occurrence. Execution/skip markers are committed before LEDs start, survive reboot, and are carried across label/repeat edits. A reboot never resumes a consumed occurrence.
-- Uploading `[]` or `{"alarms":[]}` explicitly clears only the iPhone list and stops its running curve. Missing/null/invalid `alarms`, read errors and transport errors are **not** clears. A changed list retains a running curve if it still enables that local time/date; removing/disabling it stops the curve.
+- Uploading `[]` or `{"alarms":[]}` explicitly clears only the iPhone schedule. Missing/null/invalid `alarms`, read errors and transport errors are **not** clears. Any accepted Clock edit (disable, delete, time/repeat change or clear) leaves an already running light curve unchanged, so you can silence the acoustic alarm and keep the light while getting dressed. Disabled/deleted alarms no longer schedule future starts; the existing consumption markers still prevent replay of the started occurrence. To turn the light off early, use **Stop** or manual WLED light control instead of clearing the list.
 
 List mode uses the existing independent iPhone light profile, master switch and phone-presence policy. Uploading a list does not enable the profile or rewrite its light settings. Enable/configure it once through the [profile API below](#profile-setup). Manual alarms, their revision, pins, LEDs and router configuration remain untouched.
 
@@ -199,7 +201,7 @@ Only an explicit successful no-alarm reading clears the slot:
 {"capturedAt":"2026-11-08T22:15:00+01:00","wakeAt":null}
 ```
 
-Missing/invalid fields, malformed JSON (including trailing garbage and NUL escapes), a read error, or a network error must **not** be converted to this payload. A clear or replacement ends a running iPhone alarm, but never a running manual alarm. Clearing/disabling the managed slot retains its ordering and execution watermarks.
+Missing/invalid fields, malformed JSON (including trailing garbage and NUL escapes), a read error, or a network error must **not** be converted to this payload. A clear or replacement changes only the pending iPhone schedule; an already running light alarm finishes its original rise, hold and fade-out. This also applies when switching between single and list mode. Manual alarms remain untouched. Clearing the schedule or disabling the profile retains its ordering and execution watermarks; an explicit profile disable still ends the current iPhone run.
 
 ### Profile setup
 
@@ -247,7 +249,7 @@ curl --noproxy '*' -fsS \
 curl --noproxy '*' -fsS "$WLED/wecker/sync/iphone" | jq
 ```
 
-The status distinguishes `disabled`, `empty`, `scheduled`, `waiting_for_time`, `started`, `completed`, `skipped`, `stopped`, `cancelled`, `interrupted`, `consumed`, `expired` and storage unavailability. `occurrenceState` retains the saved state even when the integration/master is disabled. ISO timestamps are UTC; the additional `*Local` numeric values are only for WLED's UI. There is no automatic repeat tomorrow without another sync.
+The status distinguishes `disabled`, `empty`, `scheduled`, `waiting_for_time`, `started`, `completed`, `skipped`, `stopped`, `cancelled`, `interrupted`, `consumed`, `expired` and storage unavailability. `occurrenceState` retains the saved schedule state even when the integration/master is disabled. While an iPhone light alarm runs, `status:"started"`, the displayed label and wake/start/end times describe that original run, even if a sync has cleared or replaced its schedule. Thus `occurrenceState` may already be `empty` or `scheduled`; finishing the old run never overwrites a cleared/replaced wake instant. `/wecker/status` exposes future scheduling separately in `next`. ISO timestamps are UTC; the additional `*Local` numeric values are only for WLED's UI. There is no automatic repeat tomorrow in single mode without another sync.
 
 ### Persistence and security
 
@@ -261,7 +263,7 @@ NVS is not included in the JSON/filesystem configuration backup. Filesystem-only
 
 This is development firmware. Successful storage, native tests and compilation are not a guarantee that every scheduling or hardware transition behaves correctly.
 
-- **Earlier edits during a running iPhone light curve:** moving a wake earlier can end the old curve while the new occurrence is excluded by the global consumed-wake watermark. A confirmed sync means the data was stored, not that this changed occurrence will run.
+- **Earlier edits during a running iPhone light curve:** the original curve keeps running, but a newly requested occurrence at or before the global consumed-wake watermark cannot start. A later occurrence that becomes due while the original curve runs is consumed as an overlap, not queued for afterwards. A confirmed sync means the data was stored, not that this changed occurrence will run.
 - **Future skips and equal local times:** list execution dates are currently carried by wake minute. A skip on a future date can suppress an earlier newly added occurrence at the same time. Skips need more precise occurrence identity for that case.
 - **Existing Sunrise nightlight:** the ordinary WLED Sunrise nightlight's throttled cleanup can arrive after this usermod takes control and be treated as manual override. Avoid combining those two automatic sunrise runners until their handoff is corrected.
 - **Expired manual one-shots:** multiple enabled expired one-shot alarms can block individual configuration edits because each save revalidates the entire list. They may need to be deactivated/removed together in one validated configuration update.
